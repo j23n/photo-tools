@@ -269,6 +269,16 @@ def find_llm_candidates(
     try:
         resp = session.post(f"{base_url}/chat/completions", json=payload, timeout=120)
         resp.raise_for_status()
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            log.error(
+                "LLM endpoint not found at %s/chat/completions — "
+                "use --base-url to point to your chat LLM, or --no-llm to skip synonym detection",
+                base_url,
+            )
+        else:
+            log.error("LLM call failed: %s", e)
+        return []
     except Exception as e:
         log.error("LLM call failed: %s", e)
         return []
