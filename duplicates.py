@@ -352,6 +352,33 @@ def apply_tag_change(
             write_keywords(path, [new], dry_run=False)
 
 
+def bulk_delete_tags(
+    tags: list[str],
+    files: list[Path],
+    dry_run: bool,
+) -> None:
+    """Delete multiple tags from multiple files in a single exiftool call per batch."""
+    if not files or not tags:
+        return
+    if dry_run:
+        log.info("[DRY RUN] Would delete %d tag(s) from %d file(s)", len(tags), len(files))
+        return
+
+    BATCH_SIZE = 500
+    total = len(files)
+    for i in range(0, total, BATCH_SIZE):
+        batch = files[i:i + BATCH_SIZE]
+        args = ["exiftool", "-overwrite_original"]
+        for tag in tags:
+            args.append(f"-IPTC:Keywords-={tag}")
+            args.append(f"-XMP:Subject-={tag}")
+        args.extend(str(f) for f in batch)
+        print(f"\r  Deleting tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
+              end="", flush=True, file=sys.stderr)
+        subprocess.run(args, capture_output=True, timeout=300)
+    print(file=sys.stderr)
+
+
 def interactive_dedup_session(
     groups: list[list[str]],
     tag_index: "dict[str, list[Path]]",
@@ -564,12 +591,12 @@ def run_delete_tag(args) -> None:
         if not matched:
             log.error("No tags match pattern '%s'", args.pattern)
             sys.exit(1)
-        total_files = len({f for files in matched.values() for f in files})
-        log.info("Pattern '%s' matched %d tag(s) across %d file(s):", args.pattern, len(matched), total_files)
-        for tag, files in sorted(matched.items()):
-            log.info("  %s  (%d files)", tag, len(files))
-        for tag, files in matched.items():
-            apply_tag_change(tag, None, files, args.dry_run)
+        matched_tags = sorted(matched.keys())
+        affected_files = list({f for files in matched.values() for f in files})
+        log.info("Pattern '%s' matched %d tag(s) across %d file(s):", args.pattern, len(matched_tags), len(affected_files))
+        for tag in matched_tags:
+            log.info("  %s  (%d files)", tag, len(matched[tag]))
+        bulk_delete_tags(matched_tags, affected_files, args.dry_run)
         return
 
     tag = args.tag.lower()
@@ -579,7 +606,7 @@ def run_delete_tag(args) -> None:
         sys.exit(1)
 
     log.info("Deleting tag '%s' from %d file(s) ...", tag, len(files))
-    apply_tag_change(tag, None, files, args.dry_run)
+    bulk_delete_tags([tag], files, args.dry_run)
 
 
 def run_rename_tag(args) -> None:
