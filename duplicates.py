@@ -38,7 +38,7 @@ DEFAULT_EMBED_MODEL = os.environ.get("EMBED_MODEL", "clip")
 DEFAULT_EMBED_API_KEY = os.environ.get("EMBED_API_KEY", os.environ.get("AI_API_KEY", ""))
 
 DEFAULT_LLM_BASE_URL = os.environ.get("LLM_BASE_URL", os.environ.get("AI_BASE_URL", "http://100.64.0.4:8000/v1"))
-DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("AI_MODEL", "gemma4"))
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("AI_MODEL", "gemma-4-e4b-it-8bit"))
 DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("AI_API_KEY", ""))
 
 
