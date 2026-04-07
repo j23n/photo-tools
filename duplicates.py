@@ -585,7 +585,9 @@ def run_dedup_tags(args) -> None:
 
     tags = list(tag_index.keys())
     string_groups = find_string_candidates(tags)
-    log.info("Found %d string-similar groups", len(string_groups))
+    log.info("Found %d string-similar groups:", len(string_groups))
+    for g in string_groups:
+        log.info("  %s", g)
 
     all_groups = string_groups
 
@@ -595,8 +597,13 @@ def run_dedup_tags(args) -> None:
         model = args.model or DEFAULT_LLM_MODEL
         log.info("Running LLM synonym detection ...")
         llm_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
-        log.info("LLM found %d synonym groups", len(llm_groups))
+        log.info("LLM returned %d groups:", len(llm_groups))
+        for g in llm_groups:
+            log.info("  %s", g)
         all_groups = merge_candidate_groups(string_groups, llm_groups)
+        log.info("Merged into %d groups:", len(all_groups))
+        for g in all_groups:
+            log.info("  %s", g)
 
     if not all_groups:
         log.info("No duplicate or synonym tags found.")
