@@ -534,6 +534,38 @@ def interactive_similar_session(
 
 
 # ---------------------------------------------------------------------------
+# list-tags subcommand
+# ---------------------------------------------------------------------------
+
+def build_list_tags_parser(subparsers) -> argparse.ArgumentParser:
+    sub = subparsers.add_parser(
+        "list-tags",
+        help="List all tags with file counts.",
+    )
+    sub.add_argument("path", type=Path, help="Target directory or file")
+    sub.add_argument("-r", "--recursive", action="store_true")
+    sub.set_defaults(func=run_list_tags)
+    return sub
+
+
+def run_list_tags(args) -> None:
+    paths = find_images(args.path, args.recursive)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    tag_index = collect_tag_index(paths)
+    if not tag_index:
+        print("No tags found.")
+        return
+
+    max_tag_len = max(len(t) for t in tag_index)
+    for tag, files in tag_index.items():
+        print(f"  {tag:<{max_tag_len}}  {len(files):>4} files")
+    print(f"\n{len(tag_index)} unique tags across {len(paths)} files")
+
+
+# ---------------------------------------------------------------------------
 # dedup-tags subcommand
 # ---------------------------------------------------------------------------
 
