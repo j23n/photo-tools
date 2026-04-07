@@ -517,17 +517,6 @@ def interactive_similar_session(
 # list-tags subcommand
 # ---------------------------------------------------------------------------
 
-def build_list_tags_parser(subparsers) -> argparse.ArgumentParser:
-    sub = subparsers.add_parser(
-        "list-tags",
-        help="List all tags with file counts.",
-    )
-    sub.add_argument("path", type=Path, help="Target directory or file")
-    sub.add_argument("-r", "--recursive", action="store_true")
-    sub.set_defaults(func=run_list_tags)
-    return sub
-
-
 def run_list_tags(args) -> None:
     paths = find_images(args.path, args.recursive)
     if not paths:
@@ -549,28 +538,87 @@ def run_list_tags(args) -> None:
 # dedup-tags subcommand
 # ---------------------------------------------------------------------------
 
-def build_dedup_parser(subparsers) -> argparse.ArgumentParser:
-    sub = subparsers.add_parser(
-        "dedup-tags",
-        help="Find and interactively merge/delete duplicate or synonym tags.",
-    )
-    sub.add_argument("path", type=Path, help="Target directory or file")
-    sub.add_argument("-r", "--recursive", action="store_true")
-    sub.add_argument("-n", "--dry-run", action="store_true",
-                     help="Preview changes without writing")
-    sub.add_argument("--no-llm", action="store_true",
-                     help="Skip LLM synonym detection, use string similarity only")
-    sub.add_argument("--delete-tag", metavar="TAG",
-                     help="Non-interactive: delete this tag from all files")
-    sub.add_argument("--rename-tag", nargs=2, metavar=("OLD", "NEW"),
-                     help="Non-interactive: rename OLD tag to NEW")
-    sub.add_argument("--base-url", default=None)
-    sub.add_argument("--api-key", default=None)
-    sub.add_argument("-m", "--model", default=None,
-                     help="LLM model for synonym detection")
-    sub.add_argument("-v", "--verbose", action="store_true")
-    sub.set_defaults(func=run_dedup_tags)
-    return sub
+def run_delete_tag(args) -> None:
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    if not args.tag and not args.pattern:
+        log.error("Provide a tag name or --pattern")
+        sys.exit(1)
+
+    paths = find_images(args.path, args.recursive)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    tag_index = collect_tag_index(paths)
+
+    if args.pattern:
+        import re
+        try:
+            regex = re.compile(args.pattern)
+        except re.error as e:
+            log.error("Invalid regex pattern: %s", e)
+            sys.exit(1)
+        matched = {tag: files for tag, files in tag_index.items() if regex.fullmatch(tag)}
+        if not matched:
+            log.error("No tags match pattern '%s'", args.pattern)
+            sys.exit(1)
+        total_files = len({f for files in matched.values() for f in files})
+        log.info("Pattern '%s' matched %d tag(s) across %d file(s):", args.pattern, len(matched), total_files)
+        for tag, files in sorted(matched.items()):
+            log.info("  %s  (%d files)", tag, len(files))
+        for tag, files in matched.items():
+            apply_tag_change(tag, None, files, args.dry_run)
+        return
+
+    tag = args.tag.lower()
+    files = tag_index.get(tag, [])
+    if not files:
+        log.error("Tag '%s' not found in any files", tag)
+        sys.exit(1)
+
+    log.info("Deleting tag '%s' from %d file(s) ...", tag, len(files))
+    apply_tag_change(tag, None, files, args.dry_run)
+
+
+def run_rename_tag(args) -> None:
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    paths = find_images(args.path, args.recursive)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    tag_index = collect_tag_index(paths)
+    old = args.old.lower()
+    new = args.new.lower()
+    files = tag_index.get(old, [])
+    if not files:
+        log.error("Tag '%s' not found in any files", old)
+        sys.exit(1)
+
+    log.info("Renaming tag '%s' -> '%s' in %d file(s) ...", old, new, len(files))
+    apply_tag_change(old, new, files, args.dry_run)
+
+
+def run_search_tags(args) -> None:
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    paths = find_images(args.path, args.recursive)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    tag_index = collect_tag_index(paths)
+    query = args.tag.lower()
+    files = tag_index.get(query, [])
+    if not files:
+        log.error("Tag '%s' not found", query)
+        sys.exit(1)
+
+    for f in sorted(files):
+        print(f)
+    print(f"\n{len(files)} file(s) with tag '{query}'")
 
 
 def run_dedup_tags(args) -> None:
@@ -584,16 +632,6 @@ def run_dedup_tags(args) -> None:
     log.info("Scanning tags in %d file(s) ...", len(paths))
     tag_index = collect_tag_index(paths)
     log.info("Found %d unique tags", len(tag_index))
-
-    # Non-interactive shortcuts
-    if args.delete_tag:
-        tag = args.delete_tag.lower()
-        apply_tag_change(tag, None, tag_index.get(tag, []), args.dry_run)
-        return
-    if args.rename_tag:
-        old, new = args.rename_tag[0].lower(), args.rename_tag[1].lower()
-        apply_tag_change(old, new, tag_index.get(old, []), args.dry_run)
-        return
 
     tags = list(tag_index.keys())
     string_groups = find_string_candidates(tags)
@@ -624,6 +662,67 @@ def run_dedup_tags(args) -> None:
 # ---------------------------------------------------------------------------
 # find-similar subcommand
 # ---------------------------------------------------------------------------
+
+def build_tags_parser(subparsers) -> None:
+    """Register the 'tags' subcommand group with list/delete/rename/dedup/search."""
+    tags_parser = subparsers.add_parser(
+        "tags",
+        help="Tag management: list, search, delete, rename, dedup.",
+    )
+    tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
+
+    # tags list
+    p = tags_sub.add_parser("list", help="List all tags with file counts.")
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=run_list_tags)
+
+    # tags search
+    p = tags_sub.add_parser("search", help="List files that have a given tag.")
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("tag", help="Tag to search for")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=run_search_tags)
+
+    # tags delete
+    p = tags_sub.add_parser("delete", help="Delete a tag (or tags matching a regex pattern) from all files.")
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("tag", nargs="?", help="Exact tag to delete")
+    p.add_argument("-p", "--pattern", help="Regex pattern to match tags for deletion")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="Preview changes without writing")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=run_delete_tag)
+
+    # tags rename
+    p = tags_sub.add_parser("rename", help="Rename a tag across all files.")
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("old", help="Tag to rename")
+    p.add_argument("new", help="New tag name")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="Preview changes without writing")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=run_rename_tag)
+
+    # tags dedup
+    p = tags_sub.add_parser("dedup", help="Find and interactively merge/delete duplicate or synonym tags.")
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="Preview changes without writing")
+    p.add_argument("--no-llm", action="store_true",
+                   help="Skip LLM synonym detection, use string similarity only")
+    p.add_argument("--base-url", default=None)
+    p.add_argument("--api-key", default=None)
+    p.add_argument("-m", "--model", default=None,
+                   help="LLM model for synonym detection")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=run_dedup_tags)
+
 
 def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub = subparsers.add_parser(
