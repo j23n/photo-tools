@@ -533,11 +533,14 @@ def build_dedup_parser(subparsers) -> argparse.ArgumentParser:
     sub.add_argument("--api-key", default=None)
     sub.add_argument("-m", "--model", default=None,
                      help="LLM model for synonym detection")
+    sub.add_argument("-v", "--verbose", action="store_true")
     sub.set_defaults(func=run_dedup_tags)
     return sub
 
 
 def run_dedup_tags(args) -> None:
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     paths = find_images(args.path, args.recursive)
     if not paths:
         log.error("No supported images found at %s", args.path)
@@ -605,11 +608,14 @@ def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub.add_argument("--api-key", default=None)
     sub.add_argument("-m", "--model", default=None,
                      help="Embedding model name (default: $EMBED_MODEL or clip)")
+    sub.add_argument("-v", "--verbose", action="store_true")
     sub.set_defaults(func=run_find_similar)
     return sub
 
 
 def run_find_similar(args) -> None:
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
     base_url = args.base_url or DEFAULT_EMBED_BASE_URL
     api_key = args.api_key or DEFAULT_EMBED_API_KEY
     model = args.model or DEFAULT_EMBED_MODEL
