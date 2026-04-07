@@ -108,7 +108,7 @@ SCREENSHOT_RESOLUTIONS = {
 
 OCR_MIN_CONFIDENCE = 40       # per-word confidence threshold (0-100)
 OCR_HIGH_CONFIDENCE = 70      # isolated single words need at least this
-OCR_MIN_WORD_LENGTH = 2       # ignore fragments shorter than this
+OCR_MIN_WORD_LENGTH = 5       # ignore fragments shorter than this
 OCR_MAX_TAGS = 15             # cap number of text: tags per image
 OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-/ ]{0,50}$")
 

@@ -37,6 +37,10 @@ DEFAULT_EMBED_BASE_URL = os.environ.get(
 DEFAULT_EMBED_MODEL = os.environ.get("EMBED_MODEL", "clip")
 DEFAULT_EMBED_API_KEY = os.environ.get("EMBED_API_KEY", os.environ.get("AI_API_KEY", ""))
 
+DEFAULT_LLM_BASE_URL = os.environ.get("LLM_BASE_URL", os.environ.get("AI_BASE_URL", "http://100.64.0.4:8000/v1"))
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("AI_MODEL", "gemma4"))
+DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("AI_API_KEY", ""))
+
 
 # ---------------------------------------------------------------------------
 # Embed client
@@ -255,13 +259,19 @@ def find_llm_candidates(
             f"(confirm or expand them if they look correct, reject by omitting them):\n{formatted}"
         )
     prompt = (
-        "You are a photo library tag curator. Identify groups of tags that are "
-        "synonyms, duplicates, or near-duplicates (including cross-prefix overlaps).\n\n"
+        "You are a photo library tag curator. Tags use the format prefix:value, "
+        "where the prefix is the CATEGORY (e.g. cc = country code, text = OCR text, "
+        "scene = scene type, animal = animal species, etc.).\n\n"
+        "Identify groups of tags that are genuine synonyms or duplicates — meaning "
+        "they refer to the SAME concept. Tags with different prefixes are almost always "
+        "in different categories and should NOT be merged (e.g. cc:es and text:es are "
+        "completely unrelated — one is a country code, the other is OCR text).\n\n"
         f"Tags with counts: {tag_list}"
         f"{string_groups_section}\n\n"
         "Return ONLY a JSON array of arrays, where each inner array contains tags "
-        "that should be merged. Only include groups with 2+ tags. "
-        "Example: [[\"scene:beach\", \"scene:beaches\", \"scene:shore\"], [\"animal:dog\", \"animal:dogs\"]]"
+        "that should be merged. Only include groups with 2+ tags. Be conservative — "
+        "only group tags you are confident are true duplicates or synonyms.\n"
+        "Example: [[\"scene:beach\", \"scene:beaches\"], [\"animal:dog\", \"animal:dogs\"]]"
     )
 
     session = requests.Session()
@@ -276,7 +286,9 @@ def find_llm_candidates(
         "max_tokens": 2048,
     }
     url = f"{base_url}/chat/completions"
-    log.debug("POST %s\n  headers: %s\n  payload: %s", url, dict(session.headers), json.dumps(payload, indent=2)[:2000])
+    log.debug("POST %s  model=%s  prompt_len=%d", url, model, len(prompt))
+    if string_groups:
+        log.debug("  string-similarity groups included: %d", len(string_groups))
     try:
         resp = session.post(url, json=payload, timeout=120)
         log.debug("Response %d: %s", resp.status_code, resp.text[:500])
@@ -578,9 +590,9 @@ def run_dedup_tags(args) -> None:
     all_groups = string_groups
 
     if not args.no_llm:
-        base_url = args.base_url or os.environ.get("AI_BASE_URL", "http://100.64.0.4:8000/v1")
-        api_key = args.api_key or os.environ.get("AI_API_KEY", "")
-        model = args.model or os.environ.get("AI_MODEL", "gemma4")
+        base_url = args.base_url or DEFAULT_LLM_BASE_URL
+        api_key = args.api_key or DEFAULT_LLM_API_KEY
+        model = args.model or DEFAULT_LLM_MODEL
         log.info("Running LLM synonym detection ...")
         llm_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
         log.info("LLM found %d synonym groups", len(llm_groups))
