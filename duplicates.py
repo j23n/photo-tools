@@ -242,14 +242,23 @@ def find_llm_candidates(
     base_url: str,
     api_key: str,
     model: str,
+    string_groups: "list[list[str]] | None" = None,
 ) -> list[list[str]]:
     tag_list = ", ".join(
         f"{tag} ({len(files)})" for tag, files in list(tag_index.items())[:500]
     )
+    string_groups_section = ""
+    if string_groups:
+        formatted = "; ".join(str(g) for g in string_groups)
+        string_groups_section = (
+            f"\n\nString-similarity analysis already found these candidate groups "
+            f"(confirm or expand them if they look correct, reject by omitting them):\n{formatted}"
+        )
     prompt = (
         "You are a photo library tag curator. Identify groups of tags that are "
         "synonyms, duplicates, or near-duplicates (including cross-prefix overlaps).\n\n"
-        f"Tags with counts: {tag_list}\n\n"
+        f"Tags with counts: {tag_list}"
+        f"{string_groups_section}\n\n"
         "Return ONLY a JSON array of arrays, where each inner array contains tags "
         "that should be merged. Only include groups with 2+ tags. "
         "Example: [[\"scene:beach\", \"scene:beaches\", \"scene:shore\"], [\"animal:dog\", \"animal:dogs\"]]"
@@ -362,26 +371,28 @@ def interactive_dedup_session(
         for j, tag in enumerate(group):
             print(f"  [{j}] {tag}  ({counts[tag]} files)")
 
-        print("  [m] merge all into first  [d] delete all but first  [k] keep all  [s] skip")
+        print(f"  0..{len(group)-1}  merge all into that tag  |  d  delete all  |  s  skip")
         while True:
-            choice = input("  > ").strip().lower()
-            if choice in ("s", "skip", ""):
+            choice = input("  > ").strip()
+            if choice.lower() in ("s", ""):
                 break
-            elif choice in ("k", "keep"):
-                break
-            elif choice in ("m", "merge"):
-                canonical = group[0]
-                for tag in group[1:]:
-                    apply_tag_change(tag, canonical, tag_index.get(tag, []), dry_run)
-                print(f"  Merged into '{canonical}'")
-                break
-            elif choice in ("d", "delete"):
-                for tag in group[1:]:
+            elif choice.lower() == "d":
+                for tag in group:
                     apply_tag_change(tag, None, tag_index.get(tag, []), dry_run)
-                print(f"  Deleted all but '{group[0]}'")
+                print(f"  Deleted all {len(group)} tags")
                 break
             else:
-                print("  Unknown choice. Use m/d/k/s")
+                try:
+                    idx = int(choice)
+                    canonical = group[idx]
+                except (ValueError, IndexError):
+                    print(f"  Unknown choice. Use 0..{len(group)-1}, d, or s")
+                    continue
+                for tag in group:
+                    if tag != canonical:
+                        apply_tag_change(tag, canonical, tag_index.get(tag, []), dry_run)
+                print(f"  Merged all into '{canonical}'")
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +582,7 @@ def run_dedup_tags(args) -> None:
         api_key = args.api_key or os.environ.get("AI_API_KEY", "")
         model = args.model or os.environ.get("AI_MODEL", "gemma4")
         log.info("Running LLM synonym detection ...")
-        llm_groups = find_llm_candidates(tag_index, base_url, api_key, model)
+        llm_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
         log.info("LLM found %d synonym groups", len(llm_groups))
         all_groups = merge_candidate_groups(string_groups, llm_groups)
 
