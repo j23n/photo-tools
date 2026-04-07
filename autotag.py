@@ -1113,10 +1113,8 @@ def watch_directory(client, target, recursive, dry_run,
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Auto-tag photos using AI vision, GPS geocoding, OCR, and EXIF metadata.",
-    )
+def _add_tag_args(parser: argparse.ArgumentParser) -> None:
+    """Add all 'tag' subcommand arguments to the given parser."""
     parser.add_argument("path", type=Path, nargs="?", help="Image file or directory")
     parser.add_argument("-r", "--recursive", action="store_true")
     parser.add_argument("-n", "--dry-run", action="store_true",
@@ -1137,8 +1135,20 @@ def main():
     parser.add_argument("--no-exif", action="store_true")
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
 
+
+def build_tag_parser(subparsers) -> argparse.ArgumentParser:
+    """Register the 'tag' subcommand on the given subparsers object."""
+    sub = subparsers.add_parser(
+        "tag",
+        help="Auto-tag photos using AI vision, GPS geocoding, OCR, and EXIF metadata.",
+    )
+    _add_tag_args(sub)
+    sub.set_defaults(func=run_tag)
+    return sub
+
+
+def run_tag(args) -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -1166,7 +1176,8 @@ def main():
         return
 
     if args.path is None:
-        parser.error("path is required (unless using --list-models)")
+        log.error("path is required (unless using --list-models)")
+        sys.exit(1)
 
     sources = []
     if enable_exif: sources.append("EXIF")
@@ -1207,6 +1218,15 @@ def main():
             failed += 1
 
     log.info("Done. %d tagged, %d skipped, %d failed.", success, skipped, failed)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Auto-tag photos using AI vision, GPS geocoding, OCR, and EXIF metadata.",
+    )
+    _add_tag_args(parser)
+    args = parser.parse_args()
+    run_tag(args)
 
 
 if __name__ == "__main__":
