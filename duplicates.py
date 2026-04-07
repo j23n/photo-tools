@@ -324,26 +324,6 @@ def find_llm_candidates(
         return []
 
 
-def merge_candidate_groups(groups_a: list[list[str]], groups_b: list[list[str]]) -> list[list[str]]:
-    """Merge two lists of groups, deduplicating overlapping groups."""
-    merged = list(groups_a)
-    existing_tags: set[str] = {t for g in groups_a for t in g}
-    for group in groups_b:
-        overlap = [t for t in group if t in existing_tags]
-        if overlap:
-            # Extend an existing group that shares tags
-            for existing in merged:
-                if any(t in existing for t in group):
-                    for t in group:
-                        if t not in existing:
-                            existing.append(t)
-                    break
-        else:
-            merged.append(group)
-            for t in group:
-                existing_tags.add(t)
-    return merged
-
 
 def apply_tag_change(
     old: str,
@@ -628,12 +608,8 @@ def run_dedup_tags(args) -> None:
         api_key = args.api_key or DEFAULT_LLM_API_KEY
         model = args.model or DEFAULT_LLM_MODEL
         log.info("Running LLM synonym detection ...")
-        llm_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
-        log.info("LLM returned %d groups:", len(llm_groups))
-        for g in llm_groups:
-            log.info("  %s", g)
-        all_groups = merge_candidate_groups(string_groups, llm_groups)
-        log.info("Merged into %d groups:", len(all_groups))
+        all_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
+        log.info("LLM final groups (%d):", len(all_groups))
         for g in all_groups:
             log.info("  %s", g)
 
