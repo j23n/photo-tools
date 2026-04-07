@@ -106,11 +106,11 @@ SCREENSHOT_RESOLUTIONS = {
     (1080, 2280), (1440, 2960),
 }
 
-OCR_MIN_CONFIDENCE = 40       # per-word confidence threshold (0-100)
-OCR_HIGH_CONFIDENCE = 70      # isolated single words need at least this
-OCR_MIN_WORD_LENGTH = 5       # ignore fragments shorter than this
-OCR_MAX_TAGS = 15             # cap number of text: tags per image
-OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-/ ]{0,50}$")
+OCR_MIN_CONFIDENCE = 60       # per-word confidence threshold (0-100)
+OCR_HIGH_CONFIDENCE = 80      # isolated single words need at least this
+OCR_MIN_PHRASE_LENGTH = 5     # ignore phrases shorter than this (total chars)
+OCR_MAX_TAGS = 10             # cap number of text: tags per image
+OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-]{0,30}$")
 
 # Image sizing — downsize before sending to AI/OCR to save memory and time
 AI_MAX_PIXELS = 1500          # max dimension (long edge) for vision model
@@ -215,6 +215,47 @@ def get_existing_keywords(exif: dict) -> set[str]:
         elif isinstance(val, list):
             keywords.update(v.lower() for v in val)
     return keywords
+
+
+def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
+    """Read only IPTC:Keywords + XMP:Subject from all paths in a single exiftool call.
+    Returns a dict mapping each path to its set of lowercase keywords."""
+    if not paths:
+        return {}
+
+    result: dict[Path, set[str]] = {}
+    # exiftool has a per-invocation arg limit on some platforms; batch in chunks
+    BATCH_SIZE = 500
+    for i in range(0, len(paths), BATCH_SIZE):
+        batch = paths[i:i + BATCH_SIZE]
+        try:
+            proc = subprocess.run(
+                ["exiftool", "-j", "-IPTC:Keywords", "-XMP:Subject"]
+                + [str(p) for p in batch],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                # Fall back to per-file reads for this batch
+                for p in batch:
+                    exif = read_exif(p)
+                    result[p] = get_existing_keywords(exif)
+                continue
+            meta_list = json.loads(proc.stdout)
+        except Exception:
+            for p in batch:
+                exif = read_exif(p)
+                result[p] = get_existing_keywords(exif)
+            continue
+
+        # exiftool echoes SourceFile as given; build a lookup to match
+        # back to the original Path objects in case of minor differences
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            result[path] = get_existing_keywords(meta)
+
+    return result
 
 
 def is_our_tag(tag: str) -> bool:
@@ -579,8 +620,6 @@ def tags_from_ocr(path: Path) -> list[str]:
             continue
         if conf < OCR_MIN_CONFIDENCE:
             continue
-        if len(word) < OCR_MIN_WORD_LENGTH:
-            continue
         if not OCR_WORD_PATTERN.match(word):
             continue
 
@@ -590,26 +629,23 @@ def tags_from_ocr(path: Path) -> list[str]:
             lines[line_key] = []
         lines[line_key].append((word, conf))
 
-    # Now decide which words to keep
+    # Join words on the same line into phrase tags
     seen = set()
     tags = []
 
     for line_key, words in lines.items():
-        line_has_multiple = len(words) >= 2
+        avg_conf = sum(c for _, c in words) / len(words)
+        # Isolated single word needs higher confidence
+        if len(words) == 1 and avg_conf < OCR_HIGH_CONFIDENCE:
+            continue
 
-        for word, conf in words:
-            # Isolated word on its own line: needs high confidence
-            if not line_has_multiple and conf < OCR_HIGH_CONFIDENCE:
-                continue
-
-            normalized = word.lower().strip()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            tags.append(f"text:{normalized}")
-
-            if len(tags) >= OCR_MAX_TAGS:
-                break
+        phrase = " ".join(w for w, _ in words).lower().strip()
+        if len(phrase) < OCR_MIN_PHRASE_LENGTH:
+            continue
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        tags.append(f"text:{phrase}")
 
         if len(tags) >= OCR_MAX_TAGS:
             break

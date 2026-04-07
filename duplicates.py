@@ -25,6 +25,7 @@ from autotag import (
     get_existing_keywords,
     prepare_image,
     read_exif,
+    read_keywords_batch,
     write_keywords,
     IMAGE_EXTENSIONS,
 )
@@ -190,9 +191,9 @@ def embed_all(
 
 def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
     index: dict[str, list[Path]] = {}
+    all_keywords = read_keywords_batch(paths)
     for path in paths:
-        exif = read_exif(path)
-        for tag in get_existing_keywords(exif):
+        for tag in all_keywords.get(path, set()):
             index.setdefault(tag, []).append(path)
     # Sort by file count descending
     return dict(sorted(index.items(), key=lambda kv: len(kv[1]), reverse=True))
