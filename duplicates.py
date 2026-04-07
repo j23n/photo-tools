@@ -266,8 +266,11 @@ def find_llm_candidates(
         "temperature": 0.1,
         "max_tokens": 2048,
     }
+    url = f"{base_url}/chat/completions"
+    log.debug("POST %s\n  headers: %s\n  payload: %s", url, dict(session.headers), json.dumps(payload, indent=2)[:2000])
     try:
-        resp = session.post(f"{base_url}/chat/completions", json=payload, timeout=120)
+        resp = session.post(url, json=payload, timeout=120)
+        log.debug("Response %d: %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
