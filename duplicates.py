@@ -194,22 +194,40 @@ def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
     return dict(sorted(index.items(), key=lambda kv: len(kv[1]), reverse=True))
 
 
+def _tag_parts(tag: str) -> tuple[str, str]:
+    """Split 'prefix:value' into ('prefix', 'value'), or ('', tag) if no prefix."""
+    if ":" in tag:
+        prefix, _, value = tag.partition(":")
+        return prefix, value
+    return "", tag
+
+
 def find_string_candidates(tags: list[str]) -> list[list[str]]:
     groups: list[list[str]] = []
     used = set()
     for i, a in enumerate(tags):
         if a in used:
             continue
+        a_prefix, a_value = _tag_parts(a)
         group = [a]
         for b in tags[i + 1:]:
             if b in used:
                 continue
-            ratio = difflib.SequenceMatcher(None, a, b).ratio()
+            b_prefix, b_value = _tag_parts(b)
+            # When both tags share the same prefix, compare only the value parts.
+            # This prevents the shared prefix from inflating similarity scores
+            # (e.g. setting:outdoor vs setting:indoor score 0.61 on values alone,
+            # but 0.90 on the full strings — the former is correct).
+            if a_prefix and a_prefix == b_prefix:
+                cmp_a, cmp_b = a_value, b_value
+            else:
+                cmp_a, cmp_b = a, b
+            ratio = difflib.SequenceMatcher(None, cmp_a, cmp_b).ratio()
             if ratio >= 0.82:
                 group.append(b)
                 continue
             # Plural forms
-            if b == a + "s" or b == a + "es" or a == b + "s" or a == b + "es":
+            if cmp_b == cmp_a + "s" or cmp_b == cmp_a + "es" or cmp_a == cmp_b + "s" or cmp_a == cmp_b + "es":
                 group.append(b)
         if len(group) >= 2:
             for t in group[1:]:
