@@ -82,8 +82,8 @@ ALL_PREFIXES = (
     "object:", "animal:", "plant:", "vehicle:", "food:",
     "activity:", "event:", "cuisine:",
     "people:", "age:",
-    "comp:", "mood:", "color:",
-    "weather:", "season:", "time:",
+    "comp:", "mood:",
+    "weather:", "time:",
     "text:",
     "year:", "month:", "day:",
     "flash:",
@@ -108,9 +108,34 @@ SCREENSHOT_RESOLUTIONS = {
 
 OCR_MIN_CONFIDENCE = 60       # per-word confidence threshold (0-100)
 OCR_HIGH_CONFIDENCE = 80      # isolated single words need at least this
-OCR_MIN_PHRASE_LENGTH = 5     # ignore phrases shorter than this (total chars)
+OCR_MIN_PHRASE_LENGTH = 6     # ignore phrases shorter than this (total chars)
 OCR_MAX_TAGS = 10             # cap number of text: tags per image
 OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-]{0,30}$")
+OCR_VOWELS = set("aeiouyàáâãäåæèéêëìíîïòóôõöùúûüÿ")
+
+# Common word-starting consonant pairs in European languages
+_VALID_ONSETS = {
+    "bl", "br", "ch", "cl", "cr", "dr", "dw", "fl", "fr", "gh", "gl", "gn", "gr",
+    "kh", "kl", "kn", "kr", "ph", "pl", "pr", "qu", "sc", "sh", "sk", "sl", "sm",
+    "sn", "sp", "sq", "st", "str", "sw", "th", "tr", "tw", "vl", "wh", "wr", "zh",
+}
+
+def _is_plausible_word(word: str) -> bool:
+    """Reject OCR fragments that aren't real words (no vowels, trailing junk, etc.)."""
+    w = word.lower()
+    # Must contain at least one vowel (rejects "ssssg", "dldebe", etc.)
+    if not any(c in OCR_VOWELS for c in w):
+        return False
+    # If word starts with 2+ consonants, check they form a valid onset
+    # (rejects mid-word fragments like "ndente", "ndomly", "llog")
+    if len(w) >= 2 and w[0] not in OCR_VOWELS and w[1] not in OCR_VOWELS:
+        if w[:3] not in _VALID_ONSETS and w[:2] not in _VALID_ONSETS:
+            return False
+    # Reject pure numbers or number-heavy strings
+    digits = sum(1 for c in w if c.isdigit())
+    if digits > len(w) / 2:
+        return False
+    return True
 
 # Image sizing — downsize before sending to AI/OCR to save memory and time
 AI_MAX_PIXELS = 1500          # max dimension (long edge) for vision model
@@ -134,6 +159,7 @@ in "animal". If it's food, ONLY in "food". If it's a plant, ONLY in "plant".
 - Only tag what is clearly visible. A missing tag is better than a wrong tag.
 - Pick the SINGLE BEST value for each enum field. Don't hedge.
 - Respect the max counts shown below. Prefer fewer, better tags over many vague ones.
+- Enum fields MUST use one of the listed values exactly. Do NOT invent new values.
 
 Return ONLY a JSON object:
 {
@@ -142,20 +168,21 @@ Return ONLY a JSON object:
   "plant":          ["max 3 — specific species, NOT generic like 'trees' or 'foliage'"],
   "vehicle":        ["max 3 — specific vehicles"],
   "food":           ["max 3 — specific dishes or ingredients"],
-  "scene":          ["max 2 — the dominant scene: street, beach, forest, kitchen, etc."],
+  "scene":          ["max 2 — the dominant scene: street, beach, forest, kitchen, etc. \
+Do NOT repeat the setting (no 'indoor'/'outdoor' here)."],
   "setting":        "indoor | outdoor | unknown",
   "landmark":       "proper name or null",
   "architecture":   "specific style (art deco, gothic, brutalist, etc.) or null",
-  "activity":       ["max 3 — what people or animals are doing"],
+  "activity":       ["max 2 — intentional activities ONLY: hiking, cooking, cycling, \
+reading, dancing, etc. SKIP poses and states: smiling, standing, sitting, walking, \
+posing, looking, resting, relaxing, watching, observing, gesturing."],
   "event":          "event type or null",
   "cuisine":        "cuisine type or null",
   "people":         "solo | couple | small group | crowd | none",
   "age":            ["max 2 — age groups visible: infant, child, teenager, adult, elderly"],
-  "comp":           ["max 2 — notable composition ONLY: aerial, macro, silhouette, bokeh, panoramic, reflection, long exposure. Skip if nothing stands out."],
+  "comp":           ["max 2 — notable composition ONLY: aerial, macro, silhouette, bokeh, panoramic, reflection, long exposure, selfie. Skip if nothing stands out."],
   "mood":           ["max 2 — dominant mood: serene, dramatic, cozy, chaotic, melancholy, festive, gritty"],
-  "color":          ["max 2 — dominant color character: warm tones, cool tones, muted, monochrome, golden, etc."],
   "weather":        "sunny | cloudy | overcast | foggy | rainy | snowy | stormy | unknown",
-  "season":         "spring | summer | autumn | winter | unknown",
   "time_of_day":    "dawn | morning | midday | afternoon | golden hour | dusk | night | unknown"
 }
 """
@@ -622,6 +649,8 @@ def tags_from_ocr(path: Path) -> list[str]:
             continue
         if not OCR_WORD_PATTERN.match(word):
             continue
+        if not _is_plausible_word(word):
+            continue
 
         # Group by page-block-par-line
         line_key = f"{fields[1]}-{fields[2]}-{fields[3]}-{fields[4]}"
@@ -898,7 +927,6 @@ def flatten_ai_tags(parsed: dict) -> list[str]:
         ("age",      "age"),
         ("comp",     "comp"),
         ("mood",     "mood"),
-        ("color",    "color"),
     ]
     for field, prefix in list_fields:
         values = parsed.get(field, [])
@@ -916,9 +944,11 @@ def flatten_ai_tags(parsed: dict) -> list[str]:
 
     # Enum fields
     for field, prefix in [("setting", "setting"), ("time_of_day", "time"),
-                          ("season", "season"), ("weather", "weather"),
-                          ("people", "people")]:
+                          ("weather", "weather"), ("people", "people")]:
         val = parsed.get(field, "unknown")
+        # Model sometimes returns a list for enum fields — take first element
+        if isinstance(val, list):
+            val = val[0] if val else "unknown"
         if val and str(val).lower() not in ("unknown", "null", "none", ""):
             tags.append(f"{prefix}:{normalize_tag_value(val)}")
 
