@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 autotag.py — Auto-tag photos using CLIP zero-shot classification, GPS reverse
-geocoding, Tesseract OCR, and EXIF metadata, then write IPTC/XMP keywords
+geocoding, PaddleOCR, and EXIF metadata, then write IPTC/XMP keywords
 via ExifTool (with DigiKam hierarchical tag support).
 
 Usage:
@@ -13,13 +13,12 @@ Usage:
     python autotag.py ~/Pictures/ --watch                # Watch for new files
     python autotag.py photo.jpg --no-geo                 # Skip reverse geocoding
     python autotag.py photo.jpg --no-clip                # Only geo + EXIF + OCR
-    python autotag.py photo.jpg --no-ocr                 # Skip Tesseract OCR
+    python autotag.py photo.jpg --no-ocr                 # Skip OCR
     python autotag.py photo.jpg --no-exif                # Skip EXIF-derived tags
 
 Requirements:
-    pip install open_clip_torch requests
+    pip install open_clip_torch requests paddleocr paddlepaddle
     brew install exiftool    # or: sudo apt install libimage-exiftool-perl
-    brew install tesseract   # or: sudo apt install tesseract-ocr
     brew install ffmpeg      # for video support (optional)
 
 Tag taxonomy (/ separator for hierarchy):
@@ -44,6 +43,8 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 
@@ -98,8 +99,8 @@ SCREENSHOT_RESOLUTIONS = {
     (1080, 2280), (1440, 2960),
 }
 
-OCR_MIN_CONFIDENCE = 60       # per-word confidence threshold (0-100)
-OCR_HIGH_CONFIDENCE = 80      # isolated single words need at least this
+OCR_MIN_CONFIDENCE = 0.60     # per-region confidence threshold (0.0-1.0)
+OCR_HIGH_CONFIDENCE = 0.80    # isolated single words need at least this
 OCR_MIN_PHRASE_LENGTH = 6     # ignore phrases shorter than this (total chars)
 OCR_MAX_TAGS = 10             # cap number of text: tags per image
 OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-]{0,30}$")
@@ -131,7 +132,7 @@ def _is_plausible_word(word: str) -> bool:
 
 # Image sizing — downsize before sending to OCR to save memory and time
 CLIP_MAX_PIXELS = 512         # max dimension for CLIP model input
-OCR_MAX_PIXELS = 2000         # max dimension for Tesseract (needs a bit more detail)
+OCR_MAX_PIXELS = 2000         # max dimension for PaddleOCR (needs a bit more detail)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +383,107 @@ def get_gps_coords(exif: dict) -> tuple[float, float] | None:
     return None
 
 
+def _parse_exif_datetime(exif: dict) -> datetime | None:
+    """Parse DateTimeOriginal/CreateDate into a datetime, or None."""
+    date_str = exif.get("DateTimeOriginal") or exif.get("CreateDate")
+    if not date_str or not isinstance(date_str, str) or len(date_str) < 10:
+        return None
+    try:
+        clean = date_str.replace("-", ":").replace("T", " ")
+        parts = clean.split(":")
+        if len(parts) >= 5:
+            year, month = int(parts[0]), int(parts[1])
+            rest = parts[2].split()
+            day = int(rest[0])
+            hour = int(parts[3])
+            minute = int(parts[4].split(".")[0].split("+")[0].split("-")[0])
+            return datetime(year, month, day, hour, minute)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def build_gps_timeline(paths: list[Path]) -> dict[Path, tuple[float, float]]:
+    """Pre-scan images and infer GPS for those missing it from nearby images.
+
+    For images without GPS, uses the GPS from the closest image (by capture
+    time) within a 30-minute window.
+    """
+    if not paths:
+        return {}
+
+    # Batch-read GPS + timestamps in one exiftool call
+    gps_data: list[tuple[Path, datetime | None, tuple[float, float] | None]] = []
+    BATCH = 500
+    for i in range(0, len(paths), BATCH):
+        batch = paths[i:i + BATCH]
+        try:
+            proc = subprocess.run(
+                ["exiftool", "-j", "-n",
+                 "-GPS:GPSLatitude", "-GPS:GPSLongitude",
+                 "-GPS:GPSLatitudeRef", "-GPS:GPSLongitudeRef",
+                 "-EXIF:DateTimeOriginal", "-EXIF:CreateDate"]
+                + [str(p) for p in batch],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                continue
+            meta_list = json.loads(proc.stdout)
+        except Exception:
+            continue
+
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            source = meta.get("SourceFile", "")
+            p = str_to_path.get(source, Path(source))
+            coords = get_gps_coords(meta)
+            dt = _parse_exif_datetime(meta)
+            gps_data.append((p, dt, coords))
+
+    # Build result: start with images that have their own GPS
+    result: dict[Path, tuple[float, float]] = {}
+    for p, _, coords in gps_data:
+        if coords:
+            result[p] = coords
+
+    # For images without GPS, find the nearest timestamped image with GPS
+    timed_gps = [(dt, coords) for _, dt, coords in gps_data
+                 if dt is not None and coords is not None]
+    if not timed_gps:
+        return result
+
+    timed_gps.sort(key=lambda x: x[0])
+    gps_times = [t for t, _ in timed_gps]
+    gps_coords = [c for _, c in timed_gps]
+
+    from bisect import bisect_left
+    MAX_GAP = 30 * 60  # 30 minutes in seconds
+
+    for p, dt, coords in gps_data:
+        if coords is not None or dt is None:
+            continue
+        # Binary search for nearest GPS-bearing image by time
+        idx = bisect_left(gps_times, dt)
+        best_dist = float("inf")
+        best_coords = None
+        for candidate_idx in (idx - 1, idx):
+            if 0 <= candidate_idx < len(gps_times):
+                gap = abs((dt - gps_times[candidate_idx]).total_seconds())
+                if gap < best_dist:
+                    best_dist = gap
+                    best_coords = gps_coords[candidate_idx]
+        if best_coords and best_dist <= MAX_GAP:
+            result[p] = best_coords
+            log.debug("Inferred GPS for %s from nearby image (%.0fs away)",
+                      p.name, best_dist)
+
+    inferred = sum(1 for p, _, c in gps_data if c is None and p in result)
+    if inferred:
+        log.info("Inferred GPS for %d image(s) from nearby timestamps", inferred)
+
+    return result
+
+
 def reverse_geocode(lat: float, lon: float) -> dict:
     global _last_nominatim_call
     elapsed = time.time() - _last_nominatim_call
@@ -545,31 +647,31 @@ def prepare_image(path: Path, max_pixels: int) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Tesseract OCR
+# PaddleOCR
 # ---------------------------------------------------------------------------
 
-def tags_from_ocr(path: Path) -> list[str]:
-    """Run Tesseract OCR and return text: tags. Uses line-grouping: words that
-    appear on a line with other words are kept at lower confidence (40%+),
-    while isolated single words need higher confidence (70%+) to survive."""
+def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
+    """Run PaddleOCR and return (text_tags, regions).
+
+    Each region dict has keys: text, score, x, y, w, h (normalized 0-1 coords).
+    Words within each detected text line are filtered for plausibility;
+    isolated single words need higher confidence to survive."""
 
     # Prepare image: convert + downsize
     prepared = prepare_image(path, OCR_MAX_PIXELS)
-    ocr_path = prepared or path  # fallback to original if ffmpeg unavailable
+    ocr_path = prepared or path  # fallback to original if prep fails
 
     try:
-        result = subprocess.run(
-            ["tesseract", str(ocr_path), "stdout", "--psm", "11", "-l", "eng", "tsv"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return []
-    except FileNotFoundError:
-        log.warning("tesseract not found — skipping OCR. Install: brew install tesseract")
-        return []
-    except (subprocess.TimeoutExpired, Exception) as e:
-        log.warning("Tesseract error on %s: %s", path.name, e)
-        return []
+        # Get image dimensions before cleanup for coordinate normalization
+        img_w, img_h = _get_image_dimensions(ocr_path)
+        if img_w is None:
+            img_w, img_h = 1, 1
+
+        ocr = _get_ocr_engine()
+        results = ocr.predict(str(ocr_path))
+    except Exception as e:
+        log.warning("PaddleOCR error on %s: %s", path.name, e)
+        return [], []
     finally:
         if prepared:
             try:
@@ -577,59 +679,70 @@ def tags_from_ocr(path: Path) -> list[str]:
             except OSError:
                 pass
 
-    # Parse TSV into structured rows, grouped by line
-    # TSV columns: level, page, block, par, line, word, left, top, w, h, conf, text
-    lines: dict[str, list[tuple[str, float]]] = {}  # line_key -> [(word, conf), ...]
-
-    for row in result.stdout.strip().split("\n")[1:]:
-        fields = row.split("\t")
-        if len(fields) < 12:
-            continue
-        conf_str, word = fields[10].strip(), fields[11].strip()
-        if not word or not conf_str:
-            continue
-        try:
-            conf = float(conf_str)
-        except ValueError:
-            continue
-        if conf < OCR_MIN_CONFIDENCE:
-            continue
-        if not OCR_WORD_PATTERN.match(word):
-            continue
-        if not _is_plausible_word(word):
-            continue
-
-        # Group by page-block-par-line
-        line_key = f"{fields[1]}-{fields[2]}-{fields[3]}-{fields[4]}"
-        if line_key not in lines:
-            lines[line_key] = []
-        lines[line_key].append((word, conf))
-
-    # Join words on the same line into phrase tags
     seen = set()
     tags = []
+    regions = []
 
-    for line_key, words in lines.items():
-        avg_conf = sum(c for _, c in words) / len(words)
-        # Isolated single word needs higher confidence
-        if len(words) == 1 and avg_conf < OCR_HIGH_CONFIDENCE:
-            continue
+    for page in results:
+        polys = page.get("dt_polys", [])
+        texts = page.get("rec_texts", [])
+        scores = page.get("rec_scores", [])
 
-        phrase = " ".join(w for w, _ in words).lower().strip()
-        if len(phrase) < OCR_MIN_PHRASE_LENGTH:
-            continue
-        if phrase in seen:
-            continue
-        seen.add(phrase)
-        tags.append(f"text/{phrase}")
+        for poly, text, score in zip(polys, texts, scores):
+            if score < OCR_MIN_CONFIDENCE:
+                continue
 
-        if len(tags) >= OCR_MAX_TAGS:
-            break
+            # Filter individual words within detected text line
+            raw_words = text.split()
+            good_words = [
+                w for w in raw_words
+                if OCR_WORD_PATTERN.match(w) and _is_plausible_word(w)
+            ]
+            if not good_words:
+                continue
+
+            # Isolated single word needs higher confidence
+            if len(good_words) == 1 and score < OCR_HIGH_CONFIDENCE:
+                continue
+
+            phrase = " ".join(good_words).lower().strip()
+            if len(phrase) < OCR_MIN_PHRASE_LENGTH:
+                continue
+            if phrase in seen:
+                continue
+            seen.add(phrase)
+            tags.append(f"text/{phrase}")
+
+            # Compute normalized bounding box from polygon
+            poly_arr = np.array(poly)
+            x_min, y_min = poly_arr.min(axis=0)
+            x_max, y_max = poly_arr.max(axis=0)
+            regions.append({
+                "text": phrase,
+                "score": float(score),
+                "x": float(x_min / img_w),
+                "y": float(y_min / img_h),
+                "w": float((x_max - x_min) / img_w),
+                "h": float((y_max - y_min) / img_h),
+            })
+
+            if len(tags) >= OCR_MAX_TAGS:
+                break
 
     if tags:
         log.debug("  OCR found %d text fragments in %s", len(tags), path.name)
 
-    return tags
+    return tags, regions
+
+
+def _get_image_dimensions(path) -> tuple[int | None, int | None]:
+    """Get image width and height. Returns (None, None) on failure."""
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(str(path)) as img:
+            return img.size  # (width, height)
+    except Exception:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +910,71 @@ def write_keywords(path: Path, keywords: list[str], dry_run: bool = False) -> bo
         return False
 
 
+def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -> bool:
+    """Write OCR text regions as IPTC ImageRegion + MWG Region metadata."""
+    if not regions:
+        return True
+    if dry_run:
+        log.info("[DRY RUN] Would write %d text regions to %s", len(regions), path.name)
+        return True
+
+    iptc_regions = []
+    mwg_regions = []
+    for r in regions:
+        iptc_regions.append({
+            "Name": r["text"],
+            "RRole": [{"Identifier": ["http://cv.iptc.org/newscodes/imageregionrole/annotatedText"],
+                        "Name": "annotated text"}],
+            "RegionBoundary": {
+                "RbShape": "rectangle", "RbUnit": "relative",
+                "RbX": round(r["x"], 5), "RbY": round(r["y"], 5),
+                "RbW": round(r["w"], 5), "RbH": round(r["h"], 5),
+            },
+        })
+        mwg_regions.append({
+            "Name": r["text"],
+            "Type": "BarCode",
+            "Description": "OCR detected text",
+            "Area": {
+                "X": round(r["x"] + r["w"] / 2, 5),  # MWG uses center point
+                "Y": round(r["y"] + r["h"] / 2, 5),
+                "W": round(r["w"], 5),
+                "H": round(r["h"], 5),
+                "Unit": "normalized",
+            },
+        })
+
+    meta = {
+        "SourceFile": str(path),
+        "XMP-iptcExt:ImageRegion": iptc_regions,
+        "XMP-mwg-rs:RegionInfo": {
+            "RegionList": mwg_regions,
+        },
+    }
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        json.dump([meta], tmp)
+        tmp.close()
+        result = subprocess.run(
+            ["exiftool", "-overwrite_original", "-struct", f"-json={tmp.name}", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            log.error("exiftool region write failed for %s: %s", path.name, result.stderr.strip())
+            return False
+        log.info("Wrote %d text regions to %s", len(regions), path.name)
+        return True
+    except Exception as e:
+        log.error("Failed to write text regions to %s: %s", path.name, e)
+        return False
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # CLIP embedding cache (stored in XMP, reused by find-similar)
 # ---------------------------------------------------------------------------
@@ -889,6 +1067,26 @@ def find_images(target: Path, recursive: bool = False) -> list[Path]:
 # Lazy-initialized singletons
 _clip_tagger = None
 _landmark_index = None
+_ocr_engine = None
+
+
+def _get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        import warnings
+        warnings.filterwarnings("ignore", module="paddle")
+        for name in ("ppocr", "paddle", "paddlex"):
+            logging.getLogger(name).setLevel(logging.ERROR)
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        from paddleocr import PaddleOCR
+        _ocr_engine = PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+        )
+    return _ocr_engine
 
 
 def _get_clip_tagger(clip_model: str = None, clip_pretrained: str = None):
@@ -926,6 +1124,7 @@ def process_single(
     clip_model: str = None,
     clip_pretrained: str = None,
     landmarks_path: Path = None,
+    gps_fallback: tuple[float, float] | None = None,
 ) -> bool:
     # Detect files where extension doesn't match content (e.g. Live Photos)
     video = is_video(path)
@@ -978,8 +1177,9 @@ def process_single(
             log.debug("  Geo:  %s", t)
             all_tags.extend(t)
 
+    ocr_regions = []
     if enable_ocr and visual_path:
-        t = tags_from_ocr(visual_path)
+        t, ocr_regions = tags_from_ocr(visual_path)
         if t:
             log.debug("  OCR:  %s", t)
             all_tags.extend(t)
@@ -1005,7 +1205,7 @@ def process_single(
 
         # Landmark lookup using the CLIP embedding
         if embedding is not None:
-            coords = get_gps_coords(exif)
+            coords = get_gps_coords(exif) or gps_fallback
             lat, lon = coords if coords else (None, None)
             try:
                 lm_index = _get_landmark_index(landmarks_path)
@@ -1042,7 +1242,10 @@ def process_single(
         log.info("No new keywords for %s", path.name)
         return True
 
-    return write_keywords(path, new_tags, dry_run)
+    ok = write_keywords(path, new_tags, dry_run)
+    if ok and ocr_regions:
+        write_text_regions(path, ocr_regions, dry_run)
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1308,8 @@ def _add_tag_args(parser: argparse.ArgumentParser) -> None:
                         help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
     parser.add_argument("--landmarks", type=Path, default=None,
                         help="Path to landmarks.json (default: ~/.local/share/photo-tools/landmarks.json)")
+    parser.add_argument("--taxonomy", type=Path, default=None,
+                        help="Path to label taxonomy JSON (default: apple_labels.json next to source)")
     parser.add_argument("--no-clip", action="store_true",
                         help="Skip CLIP tagging (only geo + EXIF + OCR)")
     parser.add_argument("--no-geo", action="store_true")
@@ -1128,6 +1333,10 @@ def run_tag(args) -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    if args.taxonomy:
+        from taxonomy import set_labels_path
+        set_labels_path(args.taxonomy)
+
     enable_clip = not args.no_clip
     enable_geo = not args.no_geo
     enable_exif = not args.no_exif
@@ -1138,6 +1347,9 @@ def run_tag(args) -> None:
     if enable_geo:  sources.append("GPS")
     if enable_ocr:  sources.append("OCR")
     if enable_clip: sources.append(f"CLIP ({args.clip_model or 'ViT-B-32'})")
+    lm_path = args.landmarks or (Path.home() / ".local/share/photo-tools/landmarks.json")
+    if enable_clip and lm_path.exists():
+        sources.append("Landmarks")
     log.info("Tag sources: %s", " + ".join(sources))
 
     if args.watch:
@@ -1157,6 +1369,10 @@ def run_tag(args) -> None:
         sys.exit(1)
 
     log.info("Found %d image(s) to process", len(images))
+
+    # Pre-scan GPS timeline so images missing GPS can borrow from neighbours
+    gps_timeline = build_gps_timeline(images) if enable_clip else {}
+
     success = failed = skipped = 0
 
     for i, img in enumerate(images, 1):
@@ -1168,7 +1384,8 @@ def run_tag(args) -> None:
                                     enable_exif=enable_exif, enable_ocr=enable_ocr,
                                     clip_model=args.clip_model,
                                     clip_pretrained=args.clip_pretrained,
-                                    landmarks_path=args.landmarks)
+                                    landmarks_path=args.landmarks,
+                                    gps_fallback=gps_timeline.get(img))
             if result:
                 success += 1
             else:

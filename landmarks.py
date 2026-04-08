@@ -61,7 +61,8 @@ class LandmarkIndex:
         lat: float | None = None,
         lon: float | None = None,
         radius_km: float = 50.0,
-        threshold: float = 0.85,
+        threshold: float = 0.55,
+        no_gps_threshold: float = 0.65,
     ) -> str | None:
         """Find the best matching landmark for an image embedding.
 
@@ -69,7 +70,8 @@ class LandmarkIndex:
             embedding: L2-normalized CLIP image embedding.
             lat, lon: GPS coordinates of the photo (optional).
             radius_km: Only consider landmarks within this radius of GPS coords.
-            threshold: Minimum cosine similarity to return a match.
+            threshold: Minimum cosine similarity to return a match (with GPS).
+            no_gps_threshold: Higher threshold when no GPS is available.
 
         Returns:
             Landmark name or None.
@@ -88,6 +90,8 @@ class LandmarkIndex:
             nearby_indices = np.where(nearby_mask)[0]
 
             if len(nearby_indices) == 0:
+                log.debug("No landmarks within %.0f km of (%.4f, %.4f)",
+                          radius_km, lat, lon)
                 return None
 
             # Build a temporary index with only nearby landmarks
@@ -96,16 +100,26 @@ class LandmarkIndex:
             tmp_index = faiss.IndexFlatIP(dim)
             tmp_index.add(nearby_embeddings)
 
-            scores, local_indices = tmp_index.search(embedding, 1)
+            k = min(5, len(nearby_indices))
+            scores, local_indices = tmp_index.search(embedding, k)
+            log.debug("Landmark top-%d nearby (within %.0f km): %s",
+                      k, radius_km,
+                      [(self.names[nearby_indices[local_indices[0, j]]],
+                        f"{scores[0, j]:.3f}")
+                       for j in range(k)])
             score = scores[0, 0]
             if score >= threshold:
                 global_idx = nearby_indices[local_indices[0, 0]]
                 return self.names[global_idx]
             return None
 
-        # No GPS: search full index
-        scores, indices = self.index.search(embedding, 1)
+        # No GPS: search full index with a stricter threshold
+        scores, indices = self.index.search(embedding, 5)
+        log.debug("Landmark top-5 global (no GPS, threshold=%.2f): %s",
+                  no_gps_threshold,
+                  [(self.names[indices[0, j]], f"{scores[0, j]:.3f}")
+                   for j in range(5)])
         score = scores[0, 0]
-        if score >= threshold:
+        if score >= no_gps_threshold:
             return self.names[indices[0, 0]]
         return None

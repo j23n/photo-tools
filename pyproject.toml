@@ -12,6 +12,8 @@ dependencies = [
     "torchvision>=0.15",
     "open-clip-torch>=2.24.0",
     "faiss-cpu>=1.7.0",
+    "paddleocr>=3.4.0",
+    "paddlepaddle>=3.3.0",
     "ruff>=0.15.9",
 ]
 

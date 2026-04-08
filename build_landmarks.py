@@ -14,10 +14,10 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import logging
 import sys
-import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import requests
+from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,68 +137,100 @@ def query_wikidata(limit: int) -> list[dict]:
 
 
 IMAGE_CACHE_DIR = Path.home() / ".cache/photo-tools/landmark-images"
-MIN_DELAY = 0.05   # seconds between requests (floor)
-MAX_DELAY = 10.0   # seconds between requests (ceiling)
-INITIAL_DELAY = 0.1
 DOWNLOAD_WORKERS = 2
-_rate_delay = INITIAL_DELAY
-_rate_lock = threading.Lock()
 
 
-def _adjust_rate(retry_after: float = 0) -> None:
-    """Adjust download delay based on rate limit feedback."""
-    global _rate_delay
-    with _rate_lock:
-        if retry_after:
-            _rate_delay = max(retry_after, _rate_delay)
-            log.warning("Rate limited — backing off to %.1fs between requests", _rate_delay)
-        else:
-            _rate_delay = max(_rate_delay * 0.95, MIN_DELAY)
+_NO_THUMB_EXTS = {".tiff", ".tif", ".djvu"}
+
+
+def _fetch(url: str, wikidata_id: str, filename: str, timeout: int = 30) -> requests.Response | None:
+    """GET *url*; retry once on 429 using Retry-After, skip on other errors."""
+    for _ in range(2):
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
+                timeout=timeout,
+                stream=True,
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 1))
+                log.warning("Rate limited on %s — sleeping %ds", filename, retry_after)
+                time.sleep(retry_after)
+                continue
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            log.warning("Image download failed for %s (%s): %s", wikidata_id, filename, e)
+            return None
+    log.warning("Still rate-limited after retry for %s (%s), skipping", wikidata_id, filename)
+    return None
+
+
+def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename: str, min_size: int = 1000) -> bool:
+    """Stream response to *dest*, returning True on success."""
+    IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        for chunk in resp.iter_content(8192):
+            f.write(chunk)
+    size = tmp.stat().st_size
+    if size < min_size:
+        log.warning("Downloaded image too small for %s (%s): %d bytes", wikidata_id, filename, size)
+        tmp.unlink()
+        return False
+    tmp.rename(dest)
+    return True
 
 
 def download_image(url: str, wikidata_id: str, max_width: int = 512) -> tuple[Path | None, bool]:
     """Download a Wikimedia Commons image, resized via thumbnail API.
 
+    For formats the thumbnail API cannot handle (TIFF, DjVu, …), the
+    full original is downloaded and resized locally with Pillow.
+
     Images are cached in ~/.cache/photo-tools/landmark-images/ by Wikidata ID.
     """
-    suffix = Path(urllib.parse.unquote(url.rsplit("/", 1)[-1])).suffix or ".jpg"
-    cached = IMAGE_CACHE_DIR / f"{wikidata_id}{suffix}"
+    filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+    ext = Path(filename).suffix.lower()
+    needs_local_resize = ext in _NO_THUMB_EXTS
+
+    # Cache as .jpg when we resize locally (original format not useful downstream)
+    cache_suffix = ".jpg" if needs_local_resize else (ext or ".jpg")
+    cached = IMAGE_CACHE_DIR / f"{wikidata_id}{cache_suffix}"
     if cached.exists() and cached.stat().st_size >= 1000:
         return cached, True
 
-    filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
-    thumb_url = f"https://commons.wikimedia.org/w/thumb.php?f={urllib.parse.quote(filename)}&w={max_width}"
-
-    max_retries = 3
-    for attempt in range(max_retries):
+    if needs_local_resize:
+        # Download the full original, then resize & convert to JPEG
+        resp = _fetch(url, wikidata_id, filename, timeout=120)
+        if resp is None:
+            return None, False
         try:
-            time.sleep(_rate_delay)
-            resp = requests.get(
-                thumb_url,
-                headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
-                timeout=30,
-                stream=True,
-            )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 1))
-                _adjust_rate(retry_after)
-                time.sleep(retry_after)
-                continue
-            _adjust_rate()
-            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content))
+            img.thumbnail((max_width, max_width))
+            img = img.convert("RGB")
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             tmp = cached.with_suffix(".tmp")
-            with open(tmp, "wb") as f:
-                for chunk in resp.iter_content(8192):
-                    f.write(chunk)
-            if tmp.stat().st_size < 1000:
+            img.save(tmp, "JPEG", quality=85)
+            size = tmp.stat().st_size
+            if size < 1000:
+                log.warning("Resized image too small for %s (%s): %d bytes", wikidata_id, filename, size)
                 tmp.unlink()
                 return None, False
             tmp.rename(cached)
             return cached, False
         except Exception as e:
-            log.debug("Failed to download %s (attempt %d): %s", filename, attempt + 1, e)
-    return None, False
+            log.warning("Local resize failed for %s (%s): %s", wikidata_id, filename, e)
+            return None, False
+    else:
+        thumb_url = f"https://commons.wikimedia.org/w/thumb.php?f={urllib.parse.quote(filename)}&w={max_width}"
+        resp = _fetch(thumb_url, wikidata_id, filename)
+        if resp is None:
+            return None, False
+        if _save_stream(resp, cached, wikidata_id, filename):
+            return cached, False
+        return None, False
 
 
 def build_database(
@@ -243,7 +276,8 @@ def build_database(
     need_download: list[dict] = []
     for lm in candidates:
         wid = lm["wikidata_id"]
-        suffix = Path(urllib.parse.unquote(lm["image_url"].rsplit("/", 1)[-1])).suffix or ".jpg"
+        ext = Path(urllib.parse.unquote(lm["image_url"].rsplit("/", 1)[-1])).suffix.lower() or ".jpg"
+        suffix = ".jpg" if ext in _NO_THUMB_EXTS else ext
         cached = IMAGE_CACHE_DIR / f"{wid}{suffix}"
         if cached.exists() and cached.stat().st_size >= 1000:
             image_paths[wid] = cached
@@ -284,20 +318,21 @@ def build_database(
 
     results = []
     embed_failed = 0
+    embed_total = len(landmarks)
 
     for i, lm in enumerate(landmarks, 1):
         wid = lm["wikidata_id"]
 
         if wid in existing and existing[wid].get("embedding"):
             results.append(existing[wid])
-            print(f"\r  embedding [{i}/{total}] {lm['name']} (cached)", end="", flush=True, file=sys.stderr)
+            print(f"\r  embedding [{i}/{embed_total}] {lm['name']} (cached)", end="", flush=True, file=sys.stderr)
             continue
 
         img_path = image_paths.get(wid)
         if img_path is None:
             continue
 
-        print(f"\r  embedding [{i}/{total}] {lm['name']:<50}", end="", flush=True, file=sys.stderr)
+        print(f"\r  embedding [{i}/{embed_total}] {lm['name']:<50}", end="", flush=True, file=sys.stderr)
 
         try:
             _, embedding = tagger.tag_image(img_path)

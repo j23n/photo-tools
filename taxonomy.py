@@ -54,7 +54,8 @@ TIME_OF_DAY_VALUES = ["dawn", "morning", "midday", "afternoon", "golden-hour", "
 # Load label→category mapping from JSON
 # ---------------------------------------------------------------------------
 
-_LABELS_PATH = Path(__file__).parent / "apple_labels.json"
+_DEFAULT_LABELS_PATH = Path(__file__).parent / "apple_labels.json"
+_labels_path: Path = _DEFAULT_LABELS_PATH
 
 # category_name → list[label]
 _category_to_labels: dict[str, list[str]] = {}
@@ -62,11 +63,20 @@ _category_to_labels: dict[str, list[str]] = {}
 _label_to_category: dict[str, str] = {}
 
 
+def set_labels_path(path: Path) -> None:
+    """Override the taxonomy JSON path. Must be called before first use."""
+    global _labels_path, _category_to_labels, _label_to_category
+    _labels_path = path
+    # Reset so next access reloads from the new path
+    _category_to_labels = {}
+    _label_to_category = {}
+
+
 def _load():
     global _category_to_labels, _label_to_category
     if _label_to_category:
         return
-    with open(_LABELS_PATH) as f:
+    with open(_labels_path) as f:
         _category_to_labels = json.load(f)
     for cat, labels in _category_to_labels.items():
         for label in labels:
