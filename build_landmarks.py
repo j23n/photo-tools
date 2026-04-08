@@ -144,12 +144,12 @@ _rate_delay = INITIAL_DELAY
 _rate_lock = threading.Lock()
 
 
-def _adjust_rate(got_429: bool) -> None:
+def _adjust_rate(retry_after: float = 0) -> None:
     """Adjust download delay based on rate limit feedback."""
     global _rate_delay
     with _rate_lock:
-        if got_429:
-            _rate_delay = min(_rate_delay * 2, MAX_DELAY)
+        if retry_after:
+            _rate_delay = max(retry_after, _rate_delay)
             log.warning("Rate limited — backing off to %.1fs between requests", _rate_delay)
         else:
             _rate_delay = max(_rate_delay * 0.95, MIN_DELAY)
@@ -168,37 +168,36 @@ def download_image(url: str, wikidata_id: str, max_width: int = 512) -> tuple[Pa
     filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
     thumb_url = f"https://commons.wikimedia.org/w/thumb.php?f={urllib.parse.quote(filename)}&w={max_width}"
 
-    try:
-        time.sleep(_rate_delay)
-        resp = requests.get(
-            thumb_url,
-            headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
-            timeout=30,
-            stream=True,
-        )
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 0))
-            if retry_after:
-                log.warning("Rate limited — Retry-After: %ds", retry_after)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            time.sleep(_rate_delay)
+            resp = requests.get(
+                thumb_url,
+                headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
+                timeout=30,
+                stream=True,
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 1))
+                _adjust_rate(retry_after)
                 time.sleep(retry_after)
-            else:
-                _adjust_rate(got_429=True)
-            return None, False
-        _adjust_rate(got_429=False)
-        resp.raise_for_status()
-        IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = cached.with_suffix(".tmp")
-        with open(tmp, "wb") as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
-        if tmp.stat().st_size < 1000:
-            tmp.unlink()
-            return None, False
-        tmp.rename(cached)
-        return cached, False
-    except Exception as e:
-        log.debug("Failed to download %s: %s", filename, e)
-        return None, False
+                continue
+            _adjust_rate()
+            resp.raise_for_status()
+            IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = cached.with_suffix(".tmp")
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
+            if tmp.stat().st_size < 1000:
+                tmp.unlink()
+                return None, False
+            tmp.rename(cached)
+            return cached, False
+        except Exception as e:
+            log.debug("Failed to download %s (attempt %d): %s", filename, attempt + 1, e)
+    return None, False
 
 
 def build_database(
@@ -234,13 +233,28 @@ def build_database(
         log.info("Dumped %d Wikidata entries to %s", len(landmarks), dump_path)
 
     # Phase 1: download all images (2 workers)
-    to_download = [lm for lm in landmarks if lm["wikidata_id"] not in existing or not existing[lm["wikidata_id"]].get("embedding")]
-    total = len(to_download)
+    candidates = [lm for lm in landmarks if lm["wikidata_id"] not in existing or not existing[lm["wikidata_id"]].get("embedding")]
     download_failed = 0
     cached_count = 0
     downloaded_count = 0
-    done_count = 0
     image_paths: dict[str, Path] = {}
+
+    # Pre-scan disk cache so only truly missing images go to the thread pool
+    need_download: list[dict] = []
+    for lm in candidates:
+        wid = lm["wikidata_id"]
+        suffix = Path(urllib.parse.unquote(lm["image_url"].rsplit("/", 1)[-1])).suffix or ".jpg"
+        cached = IMAGE_CACHE_DIR / f"{wid}{suffix}"
+        if cached.exists() and cached.stat().st_size >= 1000:
+            image_paths[wid] = cached
+            cached_count += 1
+        else:
+            need_download.append(lm)
+    if cached_count:
+        log.info("Images: %d already cached on disk, %d to download", cached_count, len(need_download))
+
+    total = len(need_download)
+    done_count = 0
 
     def _download(lm: dict) -> tuple[str, str, Path | None, bool]:
         wid = lm["wikidata_id"]
@@ -248,21 +262,22 @@ def build_database(
         return wid, lm["name"], img_path, was_cached
 
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-        futures = [pool.submit(_download, lm) for lm in to_download]
+        futures = [pool.submit(_download, lm) for lm in need_download]
         for future in as_completed(futures):
             wid, name, img_path, was_cached = future.result()
             done_count += 1
             if img_path is not None:
                 image_paths[wid] = img_path
                 if was_cached:
+                    # Race: another run cached it between our scan and download
                     cached_count += 1
                 else:
                     downloaded_count += 1
             else:
                 download_failed += 1
-            print(f"\r  images [{done_count}/{total}] {downloaded_count} new, {cached_count} cached, {download_failed} failed — {name:<40}", end="", flush=True, file=sys.stderr)
+            print(f"\r  images [{done_count}/{total}] {downloaded_count} new, {download_failed} failed — {name:<40}", end="", flush=True, file=sys.stderr)
     print(file=sys.stderr)
-    log.info("Images: %d downloaded, %d from cache, %d failed", downloaded_count, cached_count, download_failed)
+    log.info("Images: %d downloaded, %d cached, %d failed", downloaded_count, cached_count, download_failed)
 
     # Phase 2: embed
     tagger = CLIPTagger(model_name=clip_model, pretrained=clip_pretrained)
