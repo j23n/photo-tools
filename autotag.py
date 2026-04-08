@@ -184,7 +184,10 @@ def get_existing_keywords(exif: dict) -> set[str]:
             keywords.add(val.lower())
         elif isinstance(val, list):
             keywords.update(str(v).lower() for v in val)
-    return keywords
+    # Drop flat tags that are just the leaf of a hierarchical tag already present
+    # (DigiKam flattens e.g. time/midday → midday in Keywords/Subject)
+    leaves = {t.rsplit("/", 1)[-1] for t in keywords if "/" in t}
+    return {t for t in keywords if "/" in t or t not in leaves}
 
 
 def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
