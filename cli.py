@@ -4,6 +4,7 @@ from pathlib import Path
 
 import autotag
 import duplicates
+import sync_faces
 
 
 def build_landmarks_parser(subparsers) -> argparse.ArgumentParser:
@@ -50,6 +51,7 @@ def main():
     duplicates.build_tags_parser(sub)
     duplicates.build_similar_parser(sub)
     build_landmarks_parser(sub)
+    sync_faces.build_sync_faces_parser(sub)
     args = parser.parse_args()
     args.func(args)
 
