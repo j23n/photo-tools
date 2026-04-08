@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-autotag.py — Auto-tag photos using a local vision model, GPS reverse geocoding,
-Tesseract OCR, and EXIF metadata, then write IPTC/XMP keywords via ExifTool.
+autotag.py — Auto-tag photos using CLIP zero-shot classification, GPS reverse
+geocoding, Tesseract OCR, and EXIF metadata, then write IPTC/XMP keywords
+via ExifTool (with DigiKam hierarchical tag support).
 
 Usage:
     python autotag.py photo.jpg                        # Tag a single file
@@ -10,53 +11,46 @@ Usage:
     python autotag.py ~/Pictures/ -r --dry-run          # Preview without writing
     python autotag.py ~/Pictures/ -r --force             # Re-tag (replaces old AI tags)
     python autotag.py ~/Pictures/ --watch                # Watch for new files
-    python autotag.py --list-models                      # Show available models
     python autotag.py photo.jpg --no-geo                 # Skip reverse geocoding
-    python autotag.py photo.jpg --no-ai                  # Only geo + EXIF + OCR
+    python autotag.py photo.jpg --no-clip                # Only geo + EXIF + OCR
     python autotag.py photo.jpg --no-ocr                 # Skip Tesseract OCR
     python autotag.py photo.jpg --no-exif                # Skip EXIF-derived tags
 
-Environment:
-    AI_BASE_URL   Base URL of the OpenAI-compatible API  (default: http://100.64.0.4:8000/v1)
-    AI_API_KEY    API key                                 (default: none)
-    AI_MODEL      Model name                              (default: gemma4)
-
 Requirements:
-    pip install requests
+    pip install open_clip_torch requests
     brew install exiftool    # or: sudo apt install libimage-exiftool-perl
     brew install tesseract   # or: sudo apt install tesseract-ocr
     brew install ffmpeg      # for video support (optional)
 
-Tag taxonomy:
-    GPS:    country: cc: region: city: neighborhood:
-    AI:     landmark: architecture: scene: setting:
-            object: animal: plant: vehicle: food:
-            activity: event: cuisine:
-            people: age:
-            comp: mood: color:
-            weather: season: time:
-    OCR:    text:
-    EXIF:   year: month: day:
-    Flags:  weekend weekday flash:fired screenshot video ai:tagged
+Tag taxonomy (/ separator for hierarchy):
+    GPS:    country/ cc/ region/ city/ neighborhood/
+    CLIP:   animal/ food/ plant/ vehicle/ object/ scene/ activity/ event/
+            weather/ setting/ time/ landmark/
+    OCR:    text/
+    EXIF:   year/ month/ day/
+    People: people/
+    Flags:  weekend weekday flash/fired screenshot video ai:tagged
 """
 
 import argparse
 import base64
 import json
 import logging
-import mimetypes
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
 
 try:
     import requests
 except ImportError:
-    print("Error: requests package required. Install with: pip install requests")
+    print("Error: requests package required. Install with: uv add requests")
     sys.exit(1)
 
 
@@ -64,8 +58,6 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_BASE_URL = "http://100.64.0.4:8000/v1"
-DEFAULT_MODEL = "gemma4"
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".heic", ".heif", ".dng",
 }
@@ -76,17 +68,17 @@ SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 AI_TAG_MARKER = "ai:tagged"
 
 # All known prefixes — used to identify and clear our tags on --force
+# Uses / separator for DigiKam hierarchical tag support
 ALL_PREFIXES = (
-    "country:", "cc:", "region:", "city:", "neighborhood:",
-    "landmark:", "architecture:", "scene:", "setting:",
-    "object:", "animal:", "plant:", "vehicle:", "food:",
-    "activity:", "event:", "cuisine:",
-    "people:", "age:",
-    "comp:", "mood:",
-    "weather:", "time:",
-    "text:",
-    "year:", "month:", "day:",
-    "flash:",
+    "country/", "cc/", "region/", "city/", "neighborhood/",
+    "landmark/", "scene/", "setting/",
+    "object/", "animal/", "plant/", "vehicle/", "food/",
+    "activity/", "event/",
+    "people/",
+    "weather/", "time/",
+    "text/",
+    "year/", "month/", "day/",
+    "flash/",
 )
 # Bare (unprefixed) tags we manage
 BARE_TAGS = {"weekend", "weekday", "screenshot", "video", AI_TAG_MARKER}
@@ -137,57 +129,9 @@ def _is_plausible_word(word: str) -> bool:
         return False
     return True
 
-# Image sizing — downsize before sending to AI/OCR to save memory and time
-AI_MAX_PIXELS = 1500          # max dimension (long edge) for vision model
+# Image sizing — downsize before sending to OCR to save memory and time
+CLIP_MAX_PIXELS = 512         # max dimension for CLIP model input
 OCR_MAX_PIXELS = 2000         # max dimension for Tesseract (needs a bit more detail)
-
-SYSTEM_PROMPT = """\
-You are an image metadata tagger for a personal photo library. Analyze the \
-photograph and return a JSON object with descriptive keywords.
-
-Rules:
-- Use lowercase. No articles or filler words.
-- Be SPECIFIC: "golden retriever" not "dog", "carbonara" not "food", \
-"half dome" not "rock". Generic terms like "trees" or "buildings" are \
-only acceptable if nothing more specific applies.
-- Do NOT repeat the same concept across fields. If something is a vehicle, \
-put it ONLY in "vehicle", not also in "object". If it's an animal, ONLY \
-in "animal". If it's food, ONLY in "food". If it's a plant, ONLY in "plant".
-- "object" is ONLY for things that don't fit vehicle/animal/plant/food.
-- For landmarks, use the proper name ONLY if confident. Otherwise null.
-- For people, describe by visible attributes only. Never guess identities.
-- Only tag what is clearly visible. A missing tag is better than a wrong tag.
-- Pick the SINGLE BEST value for each enum field. Don't hedge.
-- Respect the max counts shown below. Prefer fewer, better tags over many vague ones.
-- Enum fields MUST use one of the listed values exactly. Do NOT invent new values.
-
-Return ONLY a JSON object:
-{
-  "object":         ["max 5 — specific things NOT covered by vehicle/animal/plant/food"],
-  "animal":         ["max 3 — specific species or breed"],
-  "plant":          ["max 3 — specific species, NOT generic like 'trees' or 'foliage'"],
-  "vehicle":        ["max 3 — specific vehicles"],
-  "food":           ["max 3 — specific dishes or ingredients"],
-  "scene":          ["max 2 — the dominant scene: street, beach, forest, kitchen, etc. \
-Do NOT repeat the setting (no 'indoor'/'outdoor' here)."],
-  "setting":        "indoor | outdoor | unknown",
-  "landmark":       "proper name or null",
-  "architecture":   "specific style (art deco, gothic, brutalist, etc.) or null",
-  "activity":       ["max 2 — intentional activities ONLY: hiking, cooking, cycling, \
-reading, dancing, etc. SKIP poses and states: smiling, standing, sitting, walking, \
-posing, looking, resting, relaxing, watching, observing, gesturing."],
-  "event":          "event type or null",
-  "cuisine":        "cuisine type or null",
-  "people":         "solo | couple | small group | crowd | none",
-  "age":            ["max 2 — age groups visible: infant, child, teenager, adult, elderly"],
-  "comp":           ["max 2 — notable composition ONLY: aerial, macro, silhouette, bokeh, panoramic, reflection, long exposure, selfie. Skip if nothing stands out."],
-  "mood":           ["max 2 — dominant mood: serene, dramatic, cozy, chaotic, melancholy, festive, gritty"],
-  "weather":        "sunny | cloudy | overcast | foggy | rainy | snowy | stormy | unknown",
-  "time_of_day":    "dawn | morning | midday | afternoon | golden hour | dusk | night | unknown"
-}
-"""
-
-USER_PROMPT = "Tag this photograph."
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +257,9 @@ def clear_our_tags(path: Path, existing: set[str], dry_run: bool = False) -> boo
     args = ["exiftool", "-overwrite_original"]
     for tag in to_remove:
         args.append(f"-IPTC:Keywords-={tag}")
-        args.append(f"-XMP:Subject-={tag}")
+        args.append(f"-XMP-dc:Subject-={tag}")
+        args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(tag)}")
+        args.append(f"-XMP-digiKam:TagsList-={tag}")
     args.append(str(path))
 
     try:
@@ -336,7 +282,8 @@ def clear_all_keywords(path: Path, dry_run: bool = False) -> bool:
 
     args = [
         "exiftool", "-overwrite_original",
-        "-IPTC:Keywords=", "-XMP:Subject=",
+        "-IPTC:Keywords=", "-XMP-dc:Subject=",
+        "-XMP-lr:HierarchicalSubject=", "-XMP-digiKam:TagsList=",
         str(path),
     ]
     try:
@@ -369,18 +316,18 @@ def tags_from_exif(exif: dict) -> list[str]:
                 year = int(parts[0])
                 month = int(parts[1])
                 day = int(parts[2].split()[0])
-                tags.append(f"year:{year}")
+                tags.append(f"year/{year}")
                 month_names = [
                     "", "january", "february", "march", "april", "may", "june",
                     "july", "august", "september", "october", "november", "december",
                 ]
                 if 1 <= month <= 12:
-                    tags.append(f"month:{month_names[month]}")
+                    tags.append(f"month/{month_names[month]}")
                 try:
                     dt = datetime.date(year, month, day)
                     day_names = ["monday", "tuesday", "wednesday", "thursday",
                                  "friday", "saturday", "sunday"]
-                    tags.append(f"day:{day_names[dt.weekday()]}")
+                    tags.append(f"day/{day_names[dt.weekday()]}")
                     tags.append("weekend" if dt.weekday() >= 5 else "weekday")
                 except ValueError:
                     pass
@@ -392,10 +339,10 @@ def tags_from_exif(exif: dict) -> list[str]:
     if flash is not None:
         try:
             if int(flash) & 1:
-                tags.append("flash:fired")
+                tags.append("flash/fired")
         except (ValueError, TypeError):
             if "fired" in str(flash).lower() and "not" not in str(flash).lower():
-                tags.append("flash:fired")
+                tags.append("flash/fired")
 
     # Screenshot detection
     width = exif.get("ImageWidth") or exif.get("File:ImageWidth")
@@ -470,22 +417,22 @@ def tags_from_gps(exif: dict) -> list[str]:
     tags = []
     country = address.get("country")
     if country:
-        tags.append(f"country:{country.lower()}")
+        tags.append(f"country/{country.lower()}")
     cc = address.get("country_code")
     if cc:
-        tags.append(f"cc:{cc.lower()}")
+        tags.append(f"cc/{cc.lower()}")
     region = (address.get("state") or address.get("region")
               or address.get("province") or address.get("county"))
     if region:
-        tags.append(f"region:{region.lower()}")
+        tags.append(f"region/{region.lower()}")
     city = (address.get("city") or address.get("town")
             or address.get("village") or address.get("municipality"))
     if city:
-        tags.append(f"city:{city.lower()}")
+        tags.append(f"city/{city.lower()}")
     neighborhood = (address.get("suburb") or address.get("neighbourhood")
                     or address.get("quarter") or address.get("district"))
     if neighborhood:
-        tags.append(f"neighborhood:{neighborhood.lower()}")
+        tags.append(f"neighborhood/{neighborhood.lower()}")
     return tags
 
 
@@ -674,7 +621,7 @@ def tags_from_ocr(path: Path) -> list[str]:
         if phrase in seen:
             continue
         seen.add(phrase)
-        tags.append(f"text:{phrase}")
+        tags.append(f"text/{phrase}")
 
         if len(tags) >= OCR_MAX_TAGS:
             break
@@ -793,175 +740,6 @@ def extract_video_frame(path: Path) -> Path | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# AI vision client
-# ---------------------------------------------------------------------------
-
-class VisionClient:
-    def __init__(self, base_url: str, api_key: str, model: str):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        if api_key:
-            self.session.headers.update({"Authorization": f"Bearer {api_key}"})
-
-    def list_models(self) -> list[str]:
-        resp = self.session.get(f"{self.base_url}/models", timeout=10)
-        resp.raise_for_status()
-        return [m["id"] for m in resp.json().get("data", [])]
-
-    def tag_image(self, image_path: Path) -> dict | None:
-        encoded = self._encode_image(image_path)
-        if encoded is None:
-            log.error("Cannot process %s for AI — no converter available", image_path.name)
-            return None
-        b64_data, media_type = encoded
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "text", "text": USER_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{media_type};base64,{b64_data}"}},
-                ]},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 1024,
-        }
-        try:
-            resp = self.session.post(f"{self.base_url}/chat/completions",
-                                     json=payload, timeout=180)
-            resp.raise_for_status()
-        except requests.ConnectionError:
-            log.error("Cannot connect to %s", self.base_url)
-            return None
-        except requests.Timeout:
-            log.error("Timed out for %s", image_path.name)
-            return None
-        except requests.HTTPError as e:
-            log.error("API error for %s: %s", image_path.name, e.response.text[:200])
-            return None
-
-        content = resp.json()["choices"][0]["message"]["content"].strip()
-        return self._parse_json(content, image_path)
-
-    @staticmethod
-    def _encode_image(path: Path) -> tuple[str, str] | None:
-        # Formats the vision API can handle natively
-        NATIVE_FORMATS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-
-        prepared = prepare_image(path, AI_MAX_PIXELS)
-        if prepared:
-            log.debug("Prepared %s -> %s (%d bytes)",
-                      path.name, prepared.name, prepared.stat().st_size)
-            with open(prepared, "rb") as f:
-                data = base64.b64encode(f.read()).decode("utf-8")
-            os.unlink(prepared)
-            return data, "image/jpeg"
-
-        # Only fall back to raw for formats the model can actually read
-        if path.suffix.lower() in NATIVE_FORMATS:
-            log.debug("Sending raw %s (native format, prepare_image unavailable)", path.name)
-            mime, _ = mimetypes.guess_type(str(path))
-            if mime is None:
-                mime = "image/jpeg"
-            with open(path, "rb") as f:
-                data = base64.b64encode(f.read()).decode("utf-8")
-            return data, mime
-
-        # Non-native format (HEIC, DNG, TIFF, etc.) and no converter — give up
-        return None
-
-    @staticmethod
-    def _parse_json(content: str, path: Path) -> dict | None:
-        if "<|channel>" in content:
-            parts = content.split("<channel|>")
-            if len(parts) > 1:
-                content = parts[-1].strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            content = "\n".join(lines)
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(content[start:end])
-                except json.JSONDecodeError:
-                    pass
-            log.error("Could not parse JSON for %s", path.name)
-            log.warning("Model response was: %s", content[:1000])
-            return None
-
-
-# ---------------------------------------------------------------------------
-# Tag flattening with deduplication
-# ---------------------------------------------------------------------------
-
-def normalize_tag_value(v: str) -> str:
-    """Normalize a tag value: lowercase, strip, collapse whitespace, use hyphens."""
-    v = str(v).lower().strip()
-    v = re.sub(r"\s+", "-", v)  # "eye level" -> "eye-level"
-    return v
-
-
-def flatten_ai_tags(parsed: dict) -> list[str]:
-    tags = []
-    seen_values = set()  # track raw values to prevent cross-category dupes
-
-    # List fields with their prefix
-    list_fields = [
-        # Order matters: specific categories first, generic last
-        ("vehicle",  "vehicle"),
-        ("animal",   "animal"),
-        ("plant",    "plant"),
-        ("food",     "food"),
-        ("object",   "object"),  # catch-all — skip if value already used above
-        ("scene",    "scene"),
-        ("activity", "activity"),
-        ("age",      "age"),
-        ("comp",     "comp"),
-        ("mood",     "mood"),
-    ]
-    for field, prefix in list_fields:
-        values = parsed.get(field, [])
-        if isinstance(values, list):
-            for v in values:
-                v = normalize_tag_value(v)
-                if not v:
-                    continue
-                # Skip if this value was already used in a more specific category
-                if field == "object" and v in seen_values:
-                    continue
-                if v not in seen_values:
-                    seen_values.add(v)
-                    tags.append(f"{prefix}:{v}")
-
-    # Enum fields
-    for field, prefix in [("setting", "setting"), ("time_of_day", "time"),
-                          ("weather", "weather"), ("people", "people")]:
-        val = parsed.get(field, "unknown")
-        # Model sometimes returns a list for enum fields — take first element
-        if isinstance(val, list):
-            val = val[0] if val else "unknown"
-        if val and str(val).lower() not in ("unknown", "null", "none", ""):
-            tags.append(f"{prefix}:{normalize_tag_value(val)}")
-
-    # Nullable fields
-    for field, prefix in [("landmark", "landmark"), ("cuisine", "cuisine"),
-                          ("event", "event"), ("architecture", "architecture")]:
-        val = parsed.get(field)
-        if val and str(val).lower() not in ("null", "none", ""):
-            tags.append(f"{prefix}:{normalize_tag_value(val)}")
-
-    return tags
-
-
 def deduplicate(tags: list[str]) -> list[str]:
     seen = set()
     deduped = []
@@ -976,6 +754,11 @@ def deduplicate(tags: list[str]) -> list[str]:
 # ExifTool writer
 # ---------------------------------------------------------------------------
 
+def hierarchical_subject(tag: str) -> str:
+    """Convert 'animal/beagle' to 'animal|beagle' for XMP-lr:HierarchicalSubject."""
+    return tag.replace("/", "|")
+
+
 def write_keywords(path: Path, keywords: list[str], dry_run: bool = False) -> bool:
     if not keywords:
         log.warning("No keywords to write for %s", path.name)
@@ -986,12 +769,17 @@ def write_keywords(path: Path, keywords: list[str], dry_run: bool = False) -> bo
             log.info("    %s", kw)
         return True
 
-    # Use = (replace) for IPTC and XMP to write the exact set we want.
-    # We build the full keyword list and set it atomically.
+    # Write four fields per tag for DigiKam/Lightroom hierarchy support:
+    #   IPTC:Keywords           = animal/beagle
+    #   XMP-dc:Subject          = animal/beagle
+    #   XMP-lr:HierarchicalSubject = animal|beagle
+    #   XMP-digiKam:TagsList    = animal/beagle
     args = ["exiftool", "-overwrite_original"]
     for kw in keywords:
         args.append(f"-IPTC:Keywords+={kw}")
-        args.append(f"-XMP:Subject+={kw}")
+        args.append(f"-XMP-dc:Subject+={kw}")
+        args.append(f"-XMP-lr:HierarchicalSubject+={hierarchical_subject(kw)}")
+        args.append(f"-XMP-digiKam:TagsList+={kw}")
     args.append(str(path))
 
     try:
@@ -1007,6 +795,61 @@ def write_keywords(path: Path, keywords: list[str], dry_run: bool = False) -> bo
     except Exception as e:
         log.error("Failed to write keywords to %s: %s", path.name, e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# CLIP embedding cache (stored in XMP, reused by find-similar)
+# ---------------------------------------------------------------------------
+
+def read_clip_cache(path: Path) -> dict:
+    result = subprocess.run(
+        [
+            "exiftool", "-j",
+            "-XMP-phototools:CLIPEmbedding",
+            "-XMP-phototools:CLIPModel",
+            "-XMP-phototools:CLIPTimestamp",
+            str(path),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return {}
+    try:
+        meta = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return meta[0] if meta else {}
+
+
+def read_cached_embedding(path: Path, model: str) -> "np.ndarray | None":
+    cache = read_clip_cache(path)
+    if cache.get("CLIPModel") != model:
+        return None
+    b64 = cache.get("CLIPEmbedding", "")
+    if not b64:
+        return None
+    try:
+        return np.frombuffer(base64.b64decode(b64), dtype=np.float32).copy()
+    except Exception:
+        return None
+
+
+def write_embedding(path: Path, vec: "np.ndarray", model: str, dry_run: bool) -> None:
+    b64 = base64.b64encode(vec.astype(np.float32).tobytes()).decode()
+    ts = datetime.now(timezone.utc).isoformat()
+    if dry_run:
+        log.info("[DRY RUN] Would cache embedding for %s", path.name)
+        return
+    subprocess.run(
+        [
+            "exiftool", "-overwrite_original",
+            f"-XMP-phototools:CLIPEmbedding={b64}",
+            f"-XMP-phototools:CLIPModel={model}",
+            f"-XMP-phototools:CLIPTimestamp={ts}",
+            str(path),
+        ],
+        capture_output=True, timeout=60,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1043,16 +886,46 @@ def find_images(target: Path, recursive: bool = False) -> list[Path]:
 # Core processing
 # ---------------------------------------------------------------------------
 
+# Lazy-initialized singletons
+_clip_tagger = None
+_landmark_index = None
+
+
+def _get_clip_tagger(clip_model: str = None, clip_pretrained: str = None):
+    global _clip_tagger
+    if _clip_tagger is None:
+        from clip_tagger import CLIPTagger, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+        _clip_tagger = CLIPTagger(
+            model_name=clip_model or DEFAULT_CLIP_MODEL,
+            pretrained=clip_pretrained or DEFAULT_CLIP_PRETRAINED,
+        )
+    return _clip_tagger
+
+
+def _get_landmark_index(landmarks_path: Path = None):
+    global _landmark_index
+    if _landmark_index is None:
+        from landmarks import LandmarkIndex, DEFAULT_LANDMARKS_PATH
+        lm_path = landmarks_path or DEFAULT_LANDMARKS_PATH
+        if not lm_path.exists():
+            log.debug("No landmarks database at %s, skipping landmark lookup", lm_path)
+            return None
+        _landmark_index = LandmarkIndex(lm_path)
+    return _landmark_index
+
+
 def process_single(
-    client: VisionClient | None,
     path: Path,
     dry_run: bool,
     force: bool,
     clear_all: bool = False,
-    enable_ai: bool = True,
+    enable_clip: bool = True,
     enable_geo: bool = True,
     enable_exif: bool = True,
     enable_ocr: bool = True,
+    clip_model: str = None,
+    clip_pretrained: str = None,
+    landmarks_path: Path = None,
 ) -> bool:
     # Detect files where extension doesn't match content (e.g. Live Photos)
     video = is_video(path)
@@ -1082,7 +955,7 @@ def process_single(
     log.info("Processing %s ...", path.name)
     all_tags = []
 
-    # For videos, extract a frame for AI and OCR
+    # For videos, extract a frame for CLIP and OCR
     frame_path = None
     if video:
         all_tags.append("video")
@@ -1090,7 +963,7 @@ def process_single(
         if frame_path is None:
             log.warning("Could not extract frame from %s, running EXIF/GPS only", path.name)
 
-    # The image to use for AI and OCR (original file or extracted frame)
+    # The image to use for CLIP and OCR (original file or extracted frame)
     visual_path = frame_path if video else path
 
     if enable_exif:
@@ -1111,12 +984,44 @@ def process_single(
             log.debug("  OCR:  %s", t)
             all_tags.extend(t)
 
-    if enable_ai and client is not None and visual_path:
-        parsed = client.tag_image(visual_path)
-        if parsed is not None:
-            t = flatten_ai_tags(parsed)
-            log.debug("  AI:   %s", t)
-            all_tags.extend(t)
+    embedding = None
+    if enable_clip and visual_path:
+        # Prepare image for CLIP (needs JPEG)
+        prepared = prepare_image(visual_path, CLIP_MAX_PIXELS)
+        clip_input = prepared or visual_path
+        try:
+            tagger = _get_clip_tagger(clip_model, clip_pretrained)
+            clip_tags, embedding = tagger.tag_image(clip_input)
+            log.debug("  CLIP: %s", clip_tags)
+            all_tags.extend(clip_tags)
+        except Exception as e:
+            log.warning("CLIP tagging failed for %s: %s", path.name, e)
+        finally:
+            if prepared:
+                try:
+                    os.unlink(prepared)
+                except OSError:
+                    pass
+
+        # Landmark lookup using the CLIP embedding
+        if embedding is not None:
+            coords = get_gps_coords(exif)
+            lat, lon = coords if coords else (None, None)
+            try:
+                lm_index = _get_landmark_index(landmarks_path)
+                if lm_index is not None:
+                    landmark = lm_index.lookup(embedding, lat=lat, lon=lon)
+                    if landmark:
+                        tag = f"landmark/{landmark.lower().replace(' ', '-')}"
+                        log.debug("  Landmark: %s", tag)
+                        all_tags.append(tag)
+            except Exception as e:
+                log.debug("Landmark lookup failed: %s", e)
+
+    # Cache CLIP embedding in XMP for duplicate detection reuse
+    if embedding is not None and not dry_run:
+        model_id = _get_clip_tagger(clip_model, clip_pretrained).model_id
+        write_embedding(path, embedding, model_id, dry_run)
 
     # Clean up temp frame
     if frame_path:
@@ -1144,8 +1049,9 @@ def process_single(
 # Watch mode
 # ---------------------------------------------------------------------------
 
-def watch_directory(client, target, recursive, dry_run,
-                    enable_ai, enable_geo, enable_exif, enable_ocr):
+def watch_directory(target, recursive, dry_run,
+                    enable_clip, enable_geo, enable_exif, enable_ocr,
+                    clip_model=None, clip_pretrained=None, landmarks_path=None):
     log.info("Watching %s for new images (Ctrl+C to stop) ...", target)
     seen: set[Path] = set()
 
@@ -1165,9 +1071,11 @@ def watch_directory(client, target, recursive, dry_run,
                 if AI_TAG_MARKER in get_existing_keywords(exif):
                     seen.add(resolved)
                     continue
-                process_single(client, img, dry_run, force=False,
-                               enable_ai=enable_ai, enable_geo=enable_geo,
-                               enable_exif=enable_exif, enable_ocr=enable_ocr)
+                process_single(img, dry_run, force=False,
+                               enable_clip=enable_clip, enable_geo=enable_geo,
+                               enable_exif=enable_exif, enable_ocr=enable_ocr,
+                               clip_model=clip_model, clip_pretrained=clip_pretrained,
+                               landmarks_path=landmarks_path)
                 seen.add(resolved)
             time.sleep(5)
         except KeyboardInterrupt:
@@ -1181,7 +1089,7 @@ def watch_directory(client, target, recursive, dry_run,
 
 def _add_tag_args(parser: argparse.ArgumentParser) -> None:
     """Add all 'tag' subcommand arguments to the given parser."""
-    parser.add_argument("path", type=Path, nargs="?", help="Image file or directory")
+    parser.add_argument("path", type=Path, help="Image file or directory")
     parser.add_argument("-r", "--recursive", action="store_true")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Preview tags without writing")
@@ -1191,12 +1099,14 @@ def _add_tag_args(parser: argparse.ArgumentParser) -> None:
                         help="Wipe ALL keywords before re-tagging (nuclear option)")
     parser.add_argument("-w", "--watch", action="store_true",
                         help="Watch directory for new images")
-    parser.add_argument("-m", "--model", default=None,
-                        help="Model name (default: $AI_MODEL or gemma4)")
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--list-models", action="store_true")
-    parser.add_argument("--no-ai", action="store_true")
+    parser.add_argument("--clip-model", default=None,
+                        help="CLIP model name (default: ViT-B-32)")
+    parser.add_argument("--clip-pretrained", default=None,
+                        help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
+    parser.add_argument("--landmarks", type=Path, default=None,
+                        help="Path to landmarks.json (default: ~/.local/share/photo-tools/landmarks.json)")
+    parser.add_argument("--no-clip", action="store_true",
+                        help="Skip CLIP tagging (only geo + EXIF + OCR)")
     parser.add_argument("--no-geo", action="store_true")
     parser.add_argument("--no-exif", action="store_true")
     parser.add_argument("--no-ocr", action="store_true")
@@ -1207,7 +1117,7 @@ def build_tag_parser(subparsers) -> argparse.ArgumentParser:
     """Register the 'tag' subcommand on the given subparsers object."""
     sub = subparsers.add_parser(
         "tag",
-        help="Auto-tag photos using AI vision, GPS geocoding, OCR, and EXIF metadata.",
+        help="Auto-tag photos using CLIP zero-shot classification, GPS geocoding, OCR, and EXIF metadata.",
     )
     _add_tag_args(sub)
     sub.set_defaults(func=run_tag)
@@ -1218,46 +1128,27 @@ def run_tag(args) -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    base_url = args.base_url or os.environ.get("AI_BASE_URL", DEFAULT_BASE_URL)
-    api_key = args.api_key or os.environ.get("AI_API_KEY", "")
-    model = args.model or os.environ.get("AI_MODEL", DEFAULT_MODEL)
-
-    enable_ai = not args.no_ai
+    enable_clip = not args.no_clip
     enable_geo = not args.no_geo
     enable_exif = not args.no_exif
     enable_ocr = not args.no_ocr
-
-    client = None
-    if enable_ai:
-        client = VisionClient(base_url=base_url, api_key=api_key, model=model)
-
-    if args.list_models:
-        c = client or VisionClient(base_url=base_url, api_key=api_key, model=model)
-        try:
-            for m in sorted(c.list_models()):
-                print(f"  {m}")
-        except Exception as e:
-            log.error("Failed to list models: %s", e)
-            sys.exit(1)
-        return
-
-    if args.path is None:
-        log.error("path is required (unless using --list-models)")
-        sys.exit(1)
 
     sources = []
     if enable_exif: sources.append("EXIF")
     if enable_geo:  sources.append("GPS")
     if enable_ocr:  sources.append("OCR")
-    if enable_ai:   sources.append(f"AI ({model})")
+    if enable_clip: sources.append(f"CLIP ({args.clip_model or 'ViT-B-32'})")
     log.info("Tag sources: %s", " + ".join(sources))
 
     if args.watch:
         if not args.path.is_dir():
             log.error("--watch requires a directory")
             sys.exit(1)
-        watch_directory(client, args.path, args.recursive, args.dry_run,
-                        enable_ai, enable_geo, enable_exif, enable_ocr)
+        watch_directory(args.path, args.recursive, args.dry_run,
+                        enable_clip, enable_geo, enable_exif, enable_ocr,
+                        clip_model=args.clip_model,
+                        clip_pretrained=args.clip_pretrained,
+                        landmarks_path=args.landmarks)
         return
 
     images = find_images(args.path, args.recursive)
@@ -1271,10 +1162,13 @@ def run_tag(args) -> None:
     for i, img in enumerate(images, 1):
         log.info("[%d/%d] %s", i, len(images), img)
         try:
-            result = process_single(client, img, args.dry_run, args.force,
+            result = process_single(img, args.dry_run, args.force,
                                     clear_all=args.clear_all,
-                                    enable_ai=enable_ai, enable_geo=enable_geo,
-                                    enable_exif=enable_exif, enable_ocr=enable_ocr)
+                                    enable_clip=enable_clip, enable_geo=enable_geo,
+                                    enable_exif=enable_exif, enable_ocr=enable_ocr,
+                                    clip_model=args.clip_model,
+                                    clip_pretrained=args.clip_pretrained,
+                                    landmarks_path=args.landmarks)
             if result:
                 success += 1
             else:
@@ -1288,7 +1182,7 @@ def run_tag(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auto-tag photos using AI vision, GPS geocoding, OCR, and EXIF metadata.",
+        description="Auto-tag photos using CLIP, GPS geocoding, OCR, and EXIF metadata.",
     )
     _add_tag_args(parser)
     args = parser.parse_args()

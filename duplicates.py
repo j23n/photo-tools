@@ -1,418 +1,94 @@
 """
-duplicates.py — Tag deduplication and similar-image detection for photo-tools.
+duplicates.py — Similar-image detection and tag management for photo-tools.
 
 Subcommands:
-    dedup-tags   Find and interactively merge/delete duplicate/synonym tags
-    find-similar Find visually similar images using CLIP embeddings
+    find-similar Find visually similar images using CLIP embeddings cached in XMP
+    tags         Tag management: list, search, delete, rename
 """
 
 import argparse
-import base64
-import difflib
-import json
 import logging
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import requests
 
 from autotag import (
     find_images,
-    get_existing_keywords,
+    hierarchical_subject,
     prepare_image,
-    read_exif,
+    read_cached_embedding,
     read_keywords_batch,
+    write_embedding,
     write_keywords,
+    CLIP_MAX_PIXELS,
     IMAGE_EXTENSIONS,
 )
 
 log = logging.getLogger("duplicates")
 
-DEFAULT_EMBED_BASE_URL = os.environ.get(
-    "EMBED_BASE_URL", os.environ.get("AI_BASE_URL", "http://100.64.0.4:8000/v1")
-)
-DEFAULT_EMBED_MODEL = os.environ.get("EMBED_MODEL", "clip")
-DEFAULT_EMBED_API_KEY = os.environ.get("EMBED_API_KEY", os.environ.get("AI_API_KEY", ""))
-
-DEFAULT_LLM_BASE_URL = os.environ.get("LLM_BASE_URL", os.environ.get("AI_BASE_URL", "http://100.64.0.4:8000/v1"))
-DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("AI_MODEL", "gemma-4-e4b-it-8bit"))
-DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get("AI_API_KEY", ""))
-
 
 # ---------------------------------------------------------------------------
-# Embed client
+# Embedding loading (reads XMP cache, falls back to CLIPTagger)
 # ---------------------------------------------------------------------------
 
-class EmbedClient:
-    def __init__(self, base_url: str, api_key: str, model: str):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        if api_key:
-            self.session.headers.update({"Authorization": f"Bearer {api_key}"})
-
-    def embed(self, path: Path) -> "np.ndarray | None":
-        prepared = prepare_image(path, 512)
-        if prepared is None:
-            log.warning("Could not prepare image for embedding: %s", path.name)
-            return None
-        try:
-            with open(prepared, "rb") as f:
-                b64_data = base64.b64encode(f.read()).decode("utf-8")
-            os.unlink(prepared)
-        except Exception as e:
-            log.warning("Failed to read prepared image %s: %s", path.name, e)
-            try:
-                os.unlink(prepared)
-            except OSError:
-                pass
-            return None
-
-        payload = {
-            "model": self.model,
-            "input": f"data:image/jpeg;base64,{b64_data}",
-        }
-        try:
-            resp = self.session.post(
-                f"{self.base_url}/embeddings", json=payload, timeout=60
-            )
-            resp.raise_for_status()
-        except requests.ConnectionError:
-            log.error("Cannot connect to %s", self.base_url)
-            return None
-        except requests.Timeout:
-            log.error("Timed out embedding %s", path.name)
-            return None
-        except requests.HTTPError as e:
-            log.error("API error for %s: %s", path.name, e.response.text[:200])
-            return None
-
-        data = resp.json().get("data", [])
-        if not data:
-            log.error("Empty embedding response for %s", path.name)
-            return None
-
-        vec = np.array(data[0]["embedding"], dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec
-
-
-# ---------------------------------------------------------------------------
-# XMP embedding cache
-# ---------------------------------------------------------------------------
-
-def read_clip_cache(path: Path) -> dict:
-    result = subprocess.run(
-        [
-            "exiftool", "-j",
-            "-XMP-phototools:CLIPEmbedding",
-            "-XMP-phototools:CLIPModel",
-            "-XMP-phototools:CLIPTimestamp",
-            str(path),
-        ],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        return {}
-    try:
-        meta = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {}
-    return meta[0] if meta else {}
-
-
-def read_cached_embedding(path: Path, model: str) -> "np.ndarray | None":
-    cache = read_clip_cache(path)
-    if cache.get("CLIPModel") != model:
-        return None
-    b64 = cache.get("CLIPEmbedding", "")
-    if not b64:
-        return None
-    try:
-        return np.frombuffer(base64.b64decode(b64), dtype=np.float32).copy()
-    except Exception:
-        return None
-
-
-def write_embedding(path: Path, vec: "np.ndarray", model: str, dry_run: bool) -> None:
-    b64 = base64.b64encode(vec.astype(np.float32).tobytes()).decode()
-    ts = datetime.now(timezone.utc).isoformat()
-    if dry_run:
-        log.info("[DRY RUN] Would cache embedding for %s", path.name)
-        return
-    subprocess.run(
-        [
-            "exiftool", "-overwrite_original",
-            f"-XMP-phototools:CLIPEmbedding={b64}",
-            f"-XMP-phototools:CLIPModel={model}",
-            f"-XMP-phototools:CLIPTimestamp={ts}",
-            str(path),
-        ],
-        capture_output=True, timeout=60,
-    )
-
-
-def embed_all(
+def load_embeddings(
     paths: list[Path],
-    client: EmbedClient,
-    model: str,
+    model_id: str,
     force: bool,
+    clip_model: str | None,
+    clip_pretrained: str | None,
     dry_run: bool,
 ) -> "dict[Path, np.ndarray]":
+    """Load CLIP embeddings for all paths. Reads from XMP cache first,
+    falls back to computing via CLIPTagger for images without cached embeddings."""
     result = {}
+    missing = []
     total = len(paths)
+
+    # Phase 1: read cached embeddings
     for i, path in enumerate(paths, 1):
-        print(f"\r  Embedding {i}/{total} ...", end="", flush=True, file=sys.stderr)
+        print(f"\r  Reading embeddings {i}/{total} ...", end="", flush=True, file=sys.stderr)
         if not force:
-            cached = read_cached_embedding(path, model)
+            cached = read_cached_embedding(path, model_id)
             if cached is not None:
                 result[path] = cached
                 continue
-        vec = client.embed(path)
-        if vec is not None:
-            write_embedding(path, vec, model, dry_run)
-            result[path] = vec
-        else:
-            log.warning("Failed to embed %s", path.name)
+        missing.append(path)
+    print(file=sys.stderr)
+
+    if not missing:
+        return result
+
+    # Phase 2: compute missing embeddings via CLIPTagger
+    log.info("%d/%d images need embedding, loading CLIP model ...", len(missing), total)
+    from clip_tagger import CLIPTagger, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+    tagger = CLIPTagger(
+        model_name=clip_model or DEFAULT_CLIP_MODEL,
+        pretrained=clip_pretrained or DEFAULT_CLIP_PRETRAINED,
+    )
+
+    for i, path in enumerate(missing, 1):
+        print(f"\r  Embedding {i}/{len(missing)} ...", end="", flush=True, file=sys.stderr)
+        prepared = prepare_image(path, CLIP_MAX_PIXELS)
+        clip_input = prepared or path
+        try:
+            _, embedding = tagger.tag_image(clip_input)
+            write_embedding(path, embedding, model_id, dry_run)
+            result[path] = embedding
+        except Exception as e:
+            log.warning("Failed to embed %s: %s", path.name, e)
+        finally:
+            if prepared:
+                try:
+                    os.unlink(prepared)
+                except OSError:
+                    pass
     print(file=sys.stderr)
     return result
-
-
-# ---------------------------------------------------------------------------
-# dedup-tags helpers
-# ---------------------------------------------------------------------------
-
-def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
-    index: dict[str, list[Path]] = {}
-    all_keywords = read_keywords_batch(paths)
-    for path in paths:
-        for tag in all_keywords.get(path, set()):
-            index.setdefault(tag, []).append(path)
-    # Sort by file count descending
-    return dict(sorted(index.items(), key=lambda kv: len(kv[1]), reverse=True))
-
-
-def _tag_parts(tag: str) -> tuple[str, str]:
-    """Split 'prefix:value' into ('prefix', 'value'), or ('', tag) if no prefix."""
-    if ":" in tag:
-        prefix, _, value = tag.partition(":")
-        return prefix, value
-    return "", tag
-
-
-def find_string_candidates(tags: list[str]) -> list[list[str]]:
-    groups: list[list[str]] = []
-    used = set()
-    for i, a in enumerate(tags):
-        if a in used:
-            continue
-        a_prefix, a_value = _tag_parts(a)
-        group = [a]
-        for b in tags[i + 1:]:
-            if b in used:
-                continue
-            b_prefix, b_value = _tag_parts(b)
-            # When both tags share the same prefix, compare only the value parts.
-            # This prevents the shared prefix from inflating similarity scores
-            # (e.g. setting:outdoor vs setting:indoor score 0.61 on values alone,
-            # but 0.90 on the full strings — the former is correct).
-            if a_prefix and a_prefix == b_prefix:
-                cmp_a, cmp_b = a_value, b_value
-            else:
-                cmp_a, cmp_b = a, b
-            ratio = difflib.SequenceMatcher(None, cmp_a, cmp_b).ratio()
-            if ratio >= 0.82:
-                group.append(b)
-                continue
-            # Plural forms
-            if cmp_b == cmp_a + "s" or cmp_b == cmp_a + "es" or cmp_a == cmp_b + "s" or cmp_a == cmp_b + "es":
-                group.append(b)
-        if len(group) >= 2:
-            for t in group[1:]:
-                used.add(t)
-            used.add(a)
-            groups.append(group)
-    return groups
-
-
-def find_llm_candidates(
-    tag_index: "dict[str, list[Path]]",
-    base_url: str,
-    api_key: str,
-    model: str,
-    string_groups: "list[list[str]] | None" = None,
-) -> list[list[str]]:
-    tag_list = ", ".join(
-        f"{tag} ({len(files)})" for tag, files in list(tag_index.items())[:500]
-    )
-    string_groups_section = ""
-    if string_groups:
-        formatted = "; ".join(str(g) for g in string_groups)
-        string_groups_section = (
-            f"\n\nString-similarity analysis already found these candidate groups "
-            f"(confirm or expand them if they look correct, reject by omitting them):\n{formatted}"
-        )
-    prompt = (
-        "You are a photo library tag curator. Tags use the format prefix:value, "
-        "where the prefix is the CATEGORY (e.g. cc = country code, text = OCR text, "
-        "scene = scene type, animal = animal species, etc.).\n\n"
-        "Identify groups of tags that are genuine synonyms or duplicates — meaning "
-        "they refer to the SAME concept. Tags with different prefixes are almost always "
-        "in different categories and should NOT be merged (e.g. cc:es and text:es are "
-        "completely unrelated — one is a country code, the other is OCR text).\n\n"
-        f"Tags with counts: {tag_list}"
-        f"{string_groups_section}\n\n"
-        "Return ONLY a JSON array of arrays, where each inner array contains tags "
-        "that should be merged. Only include groups with 2+ tags. Be conservative — "
-        "only group tags you are confident are true duplicates or synonyms.\n"
-        "Example: [[\"scene:beach\", \"scene:beaches\"], [\"animal:dog\", \"animal:dogs\"]]"
-    )
-
-    session = requests.Session()
-    session.headers.update({"Content-Type": "application/json"})
-    if api_key:
-        session.headers.update({"Authorization": f"Bearer {api_key}"})
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": 2048,
-    }
-    url = f"{base_url}/chat/completions"
-    log.debug("POST %s  model=%s  prompt_len=%d", url, model, len(prompt))
-    if string_groups:
-        log.debug("  string-similarity groups included: %d", len(string_groups))
-    try:
-        resp = session.post(url, json=payload, timeout=120)
-        log.debug("Response %d: %s", resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            log.error(
-                "LLM endpoint not found at %s/chat/completions — "
-                "use --base-url to point to your chat LLM, or --no-llm to skip synonym detection",
-                base_url,
-            )
-        else:
-            log.error("LLM call failed: %s", e)
-        return []
-    except Exception as e:
-        log.error("LLM call failed: %s", e)
-        return []
-
-    content = resp.json()["choices"][0]["message"]["content"].strip()
-    # Strip markdown code fences if present
-    if content.startswith("```"):
-        lines = content.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        content = "\n".join(lines).strip()
-    start = content.find("[")
-    if start < 0:
-        return []
-    try:
-        parsed = json.loads(content[start:])
-        return [g for g in parsed if isinstance(g, list) and len(g) >= 2]
-    except json.JSONDecodeError:
-        log.warning("Could not parse LLM response for tag candidates")
-        return []
-
-
-
-def apply_tag_change(
-    old: str,
-    new: "str | None",
-    files: list[Path],
-    dry_run: bool,
-) -> None:
-    if not files:
-        return
-    if dry_run:
-        action = f"rename to '{new}'" if new else "delete"
-        log.info("[DRY RUN] Would %s '%s' in %d file(s)", action, old, len(files))
-        return
-
-    # Batch remove old tag from all files
-    args = ["exiftool", "-overwrite_original"]
-    args.append(f"-IPTC:Keywords-={old}")
-    args.append(f"-XMP:Subject-={old}")
-    args.extend(str(f) for f in files)
-    subprocess.run(args, capture_output=True, timeout=120)
-
-    # Add new tag if renaming
-    if new:
-        for path in files:
-            write_keywords(path, [new], dry_run=False)
-
-
-def bulk_delete_tags(
-    tags: list[str],
-    files: list[Path],
-    dry_run: bool,
-) -> None:
-    """Delete multiple tags from multiple files in a single exiftool call per batch."""
-    if not files or not tags:
-        return
-    if dry_run:
-        log.info("[DRY RUN] Would delete %d tag(s) from %d file(s)", len(tags), len(files))
-        return
-
-    BATCH_SIZE = 500
-    total = len(files)
-    for i in range(0, total, BATCH_SIZE):
-        batch = files[i:i + BATCH_SIZE]
-        args = ["exiftool", "-overwrite_original"]
-        for tag in tags:
-            args.append(f"-IPTC:Keywords-={tag}")
-            args.append(f"-XMP:Subject-={tag}")
-        args.extend(str(f) for f in batch)
-        print(f"\r  Deleting tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
-              end="", flush=True, file=sys.stderr)
-        subprocess.run(args, capture_output=True, timeout=300)
-    print(file=sys.stderr)
-
-
-def interactive_dedup_session(
-    groups: list[list[str]],
-    tag_index: "dict[str, list[Path]]",
-    dry_run: bool,
-) -> None:
-    total = len(groups)
-    for i, group in enumerate(groups, 1):
-        counts = {tag: len(tag_index.get(tag, [])) for tag in group}
-        print(f"\nGroup {i}/{total}:")
-        for j, tag in enumerate(group):
-            print(f"  [{j}] {tag}  ({counts[tag]} files)")
-
-        print(f"  0..{len(group)-1}  merge all into that tag  |  d  delete all  |  s  skip")
-        while True:
-            choice = input("  > ").strip()
-            if choice.lower() in ("s", ""):
-                break
-            elif choice.lower() == "d":
-                for tag in group:
-                    apply_tag_change(tag, None, tag_index.get(tag, []), dry_run)
-                print(f"  Deleted all {len(group)} tags")
-                break
-            else:
-                try:
-                    idx = int(choice)
-                    canonical = group[idx]
-                except (ValueError, IndexError):
-                    print(f"  Unknown choice. Use 0..{len(group)-1}, d, or s")
-                    continue
-                for tag in group:
-                    if tag != canonical:
-                        apply_tag_change(tag, canonical, tag_index.get(tag, []), dry_run)
-                print(f"  Merged all into '{canonical}'")
-                break
 
 
 # ---------------------------------------------------------------------------
@@ -542,8 +218,72 @@ def interactive_similar_session(
 
 
 # ---------------------------------------------------------------------------
-# list-tags subcommand
+# tags subcommands (list, search, delete, rename)
 # ---------------------------------------------------------------------------
+
+def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
+    index: dict[str, list[Path]] = {}
+    all_keywords = read_keywords_batch(paths)
+    for path in paths:
+        for tag in all_keywords.get(path, set()):
+            index.setdefault(tag, []).append(path)
+    return dict(sorted(index.items(), key=lambda kv: len(kv[1]), reverse=True))
+
+
+def apply_tag_change(
+    old: str,
+    new: "str | None",
+    files: list[Path],
+    dry_run: bool,
+) -> None:
+    if not files:
+        return
+    if dry_run:
+        action = f"rename to '{new}'" if new else "delete"
+        log.info("[DRY RUN] Would %s '%s' in %d file(s)", action, old, len(files))
+        return
+
+    args = ["exiftool", "-overwrite_original"]
+    args.append(f"-IPTC:Keywords-={old}")
+    args.append(f"-XMP-dc:Subject-={old}")
+    args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(old)}")
+    args.append(f"-XMP-digiKam:TagsList-={old}")
+    args.extend(str(f) for f in files)
+    subprocess.run(args, capture_output=True, timeout=120)
+
+    if new:
+        for path in files:
+            write_keywords(path, [new], dry_run=False)
+
+
+def bulk_delete_tags(
+    tags: list[str],
+    files: list[Path],
+    dry_run: bool,
+) -> None:
+    """Delete multiple tags from multiple files in a single exiftool call per batch."""
+    if not files or not tags:
+        return
+    if dry_run:
+        log.info("[DRY RUN] Would delete %d tag(s) from %d file(s)", len(tags), len(files))
+        return
+
+    BATCH_SIZE = 500
+    total = len(files)
+    for i in range(0, total, BATCH_SIZE):
+        batch = files[i:i + BATCH_SIZE]
+        args = ["exiftool", "-overwrite_original"]
+        for tag in tags:
+            args.append(f"-IPTC:Keywords-={tag}")
+            args.append(f"-XMP-dc:Subject-={tag}")
+            args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(tag)}")
+            args.append(f"-XMP-digiKam:TagsList-={tag}")
+        args.extend(str(f) for f in batch)
+        print(f"\r  Deleting tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
+              end="", flush=True, file=sys.stderr)
+        subprocess.run(args, capture_output=True, timeout=300)
+    print(file=sys.stderr)
+
 
 def run_list_tags(args) -> None:
     paths = find_images(args.path, args.recursive)
@@ -561,10 +301,6 @@ def run_list_tags(args) -> None:
         print(f"  {tag:<{max_tag_len}}  {len(files):>4} files")
     print(f"\n{len(tag_index)} unique tags across {len(paths)} files")
 
-
-# ---------------------------------------------------------------------------
-# dedup-tags subcommand
-# ---------------------------------------------------------------------------
 
 def run_delete_tag(args) -> None:
     if args.verbose:
@@ -649,53 +385,15 @@ def run_search_tags(args) -> None:
     print(f"\n{len(files)} file(s) with tag '{query}'")
 
 
-def run_dedup_tags(args) -> None:
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    paths = find_images(args.path, args.recursive)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    log.info("Scanning tags in %d file(s) ...", len(paths))
-    tag_index = collect_tag_index(paths)
-    log.info("Found %d unique tags", len(tag_index))
-
-    tags = list(tag_index.keys())
-    string_groups = find_string_candidates(tags)
-    log.info("Found %d string-similar groups:", len(string_groups))
-    for g in string_groups:
-        log.info("  %s", g)
-
-    all_groups = string_groups
-
-    if not args.no_llm:
-        base_url = args.base_url or DEFAULT_LLM_BASE_URL
-        api_key = args.api_key or DEFAULT_LLM_API_KEY
-        model = args.model or DEFAULT_LLM_MODEL
-        log.info("Running LLM synonym detection ...")
-        all_groups = find_llm_candidates(tag_index, base_url, api_key, model, string_groups)
-        log.info("LLM final groups (%d):", len(all_groups))
-        for g in all_groups:
-            log.info("  %s", g)
-
-    if not all_groups:
-        log.info("No duplicate or synonym tags found.")
-        return
-
-    log.info("Starting interactive dedup session (%d groups) ...", len(all_groups))
-    interactive_dedup_session(all_groups, tag_index, args.dry_run)
-
-
 # ---------------------------------------------------------------------------
-# find-similar subcommand
+# CLI parsers
 # ---------------------------------------------------------------------------
 
 def build_tags_parser(subparsers) -> None:
-    """Register the 'tags' subcommand group with list/delete/rename/dedup/search."""
+    """Register the 'tags' subcommand group with list/delete/rename/search."""
     tags_parser = subparsers.add_parser(
         "tags",
-        help="Tag management: list, search, delete, rename, dedup.",
+        help="Tag management: list, search, delete, rename.",
     )
     tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
 
@@ -736,21 +434,6 @@ def build_tags_parser(subparsers) -> None:
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=run_rename_tag)
 
-    # tags dedup
-    p = tags_sub.add_parser("dedup", help="Find and interactively merge/delete duplicate or synonym tags.")
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("-n", "--dry-run", action="store_true",
-                   help="Preview changes without writing")
-    p.add_argument("--no-llm", action="store_true",
-                   help="Skip LLM synonym detection, use string similarity only")
-    p.add_argument("--base-url", default=None)
-    p.add_argument("--api-key", default=None)
-    p.add_argument("-m", "--model", default=None,
-                   help="LLM model for synonym detection")
-    p.add_argument("-v", "--verbose", action="store_true")
-    p.set_defaults(func=run_dedup_tags)
-
 
 def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub = subparsers.add_parser(
@@ -763,16 +446,14 @@ def build_similar_parser(subparsers) -> argparse.ArgumentParser:
                      help="Preview moves without executing")
     sub.add_argument("--threshold", type=float, default=0.90,
                      help="Cosine similarity cutoff (default: 0.90)")
-    sub.add_argument("--embed-only", action="store_true",
-                     help="Compute and cache embeddings, then exit")
     sub.add_argument("--dest", type=Path, default=None,
                      help="Destination directory for moved duplicates")
     sub.add_argument("--force", action="store_true",
                      help="Re-embed even if a cached embedding exists")
-    sub.add_argument("--base-url", default=None)
-    sub.add_argument("--api-key", default=None)
-    sub.add_argument("-m", "--model", default=None,
-                     help="Embedding model name (default: $EMBED_MODEL or clip)")
+    sub.add_argument("--clip-model", default=None,
+                     help="CLIP model name (default: ViT-B-32)")
+    sub.add_argument("--clip-pretrained", default=None,
+                     help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
     sub.add_argument("-v", "--verbose", action="store_true")
     sub.set_defaults(func=run_find_similar)
     return sub
@@ -781,12 +462,13 @@ def build_similar_parser(subparsers) -> argparse.ArgumentParser:
 def run_find_similar(args) -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    base_url = args.base_url or DEFAULT_EMBED_BASE_URL
-    api_key = args.api_key or DEFAULT_EMBED_API_KEY
-    model = args.model or DEFAULT_EMBED_MODEL
+
+    from clip_tagger import DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+    clip_model = args.clip_model or DEFAULT_CLIP_MODEL
+    clip_pretrained = args.clip_pretrained or DEFAULT_CLIP_PRETRAINED
+    model_id = f"{clip_model}/{clip_pretrained}"
 
     all_files = find_images(args.path, args.recursive)
-    # Filter to images only (exclude videos)
     image_paths = [p for p in all_files if p.suffix.lower() in IMAGE_EXTENSIONS]
 
     if not image_paths:
@@ -794,12 +476,12 @@ def run_find_similar(args) -> None:
         sys.exit(1)
 
     log.info("Found %d image(s) to process", len(image_paths))
-    client = EmbedClient(base_url=base_url, api_key=api_key, model=model)
-    embeddings = embed_all(image_paths, client, model, args.force, args.dry_run)
-
-    if args.embed_only:
-        print(f"Embedded {len(embeddings)}/{len(image_paths)} images")
-        return
+    embeddings = load_embeddings(
+        image_paths, model_id, args.force,
+        clip_model=args.clip_model,
+        clip_pretrained=args.clip_pretrained,
+        dry_run=args.dry_run,
+    )
 
     log.info("Clustering similar images (threshold=%.2f) ...", args.threshold)
     clusters = cluster_similar(embeddings, args.threshold)
@@ -813,7 +495,6 @@ def run_find_similar(args) -> None:
     if args.dest:
         dest_root = args.dest
     else:
-        # Default: _duplicates/ under the common ancestor of all images
         common = image_paths[0].parent
         for p in image_paths[1:]:
             while not str(p).startswith(str(common)):
