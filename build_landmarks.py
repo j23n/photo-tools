@@ -17,9 +17,10 @@ import argparse
 import json
 import logging
 import sys
-import tempfile
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -34,100 +35,170 @@ log = logging.getLogger("build_landmarks")
 
 WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 
-# Query for notable landmarks with coordinates and images
-SPARQL_QUERY = """\
+# Per-type query — uses direct P31 only (no recursive P279* subclass traversal)
+SPARQL_TYPE_QUERY = """\
 SELECT ?item ?itemLabel ?lat ?lon ?image ?sitelinks WHERE {{
-  ?item wdt:P31/wdt:P279* ?type .
-  VALUES ?type {{
-    wd:Q570116    # tourist attraction
-    wd:Q839954    # archaeological site
-    wd:Q4989906   # monument
-    wd:Q811979    # architectural structure
-    wd:Q35112127  # natural landmark
-    wd:Q2319498   # landmark
-    wd:Q751876    # castle
-    wd:Q16970     # church building
-    wd:Q32815     # mosque
-    wd:Q44539     # temple
-    wd:Q23413     # palace
-    wd:Q3947      # house
-    wd:Q12280     # bridge
-    wd:Q8502      # mountain
-    wd:Q23397     # lake
-    wd:Q34038     # waterfall
-    wd:Q133056    # cave
-    wd:Q33506     # museum
-    wd:Q483110    # stadium
-  }}
+  ?item wdt:P31 wd:{qid} .
   ?item wdt:P625 ?coords .
   ?item wdt:P18 ?image .
   ?item wikibase:sitelinks ?sitelinks .
   BIND(geof:latitude(?coords) AS ?lat)
   BIND(geof:longitude(?coords) AS ?lon)
+  FILTER(BOUND(?lat) && BOUND(?lon))
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
 }}
 ORDER BY DESC(?sitelinks)
 LIMIT {limit}
 """
 
+LANDMARK_TYPES = [
+    # (qid, label, per-type limit)
+    ("Q570116", "tourist attraction", 2000),
+    ("Q839954", "archaeological site", 1500),
+    ("Q4989906", "monument", 2000),
+    ("Q811979", "architectural structure", 2000),
+    ("Q35112127", "natural landmark", 500),
+    ("Q2319498", "landmark", 500),
+    ("Q751876", "castle", 1500),
+    ("Q16970", "church building", 1500),
+    ("Q32815", "mosque", 1500),
+    ("Q44539", "temple", 1500),
+    ("Q23413", "palace", 1500),
+    ("Q3947", "house", 2000),
+    ("Q12280", "bridge", 1500),
+    ("Q8502", "mountain", 1500),
+    ("Q23397", "lake", 1500),
+    ("Q34038", "waterfall", 500),
+    ("Q133056", "cave", 500),
+    ("Q33506", "museum", 1500),
+    ("Q483110", "stadium", 1500),
+]
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = 30  # seconds
+
+
+def _sparql_get(query: str) -> list[dict]:
+    """Execute a SPARQL query with retry on timeout/5xx."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                WIKIDATA_SPARQL,
+                params={"query": query, "format": "json"},
+                headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            return resp.json()["results"]["bindings"]
+        except (requests.exceptions.HTTPError, requests.exceptions.Timeout) as e:
+            if attempt == MAX_RETRIES:
+                raise
+            retry_after = int(getattr(getattr(e, "response", None), "headers", {}).get("Retry-After", 0))
+            wait = retry_after if retry_after else RETRY_BACKOFF * attempt
+            log.warning("Query failed (%s), retrying in %ds (%d/%d)", e, wait, attempt, MAX_RETRIES)
+            time.sleep(wait)
+    return []  # unreachable, keeps type checkers happy
+
 
 def query_wikidata(limit: int) -> list[dict]:
-    """Query Wikidata SPARQL for notable landmarks."""
-    log.info("Querying Wikidata for top %d landmarks ...", limit)
-    query = SPARQL_QUERY.format(limit=limit)
-    resp = requests.get(
-        WIKIDATA_SPARQL,
-        params={"query": query, "format": "json"},
-        headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    results = resp.json()["results"]["bindings"]
-    log.info("Got %d results from Wikidata", len(results))
+    """Query Wikidata SPARQL for notable landmarks, one type at a time."""
+    log.info("Querying Wikidata for top %d landmarks across %d types ...", limit, len(LANDMARK_TYPES))
 
-    landmarks = []
-    seen_ids = set()
-    for r in results:
-        wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
-        if wikidata_id in seen_ids:
-            continue
-        seen_ids.add(wikidata_id)
-        landmarks.append({
-            "name": r["itemLabel"]["value"],
-            "wikidata_id": wikidata_id,
-            "lat": float(r["lat"]["value"]),
-            "lon": float(r["lon"]["value"]),
-            "image_url": r["image"]["value"],
-        })
-    log.info("Deduplicated to %d unique landmarks", len(landmarks))
+    seen_ids: dict[str, dict] = {}
+    for qid, label, type_limit in LANDMARK_TYPES:
+        log.info("  Querying %s (%s, limit %d) ...", label, qid, type_limit)
+        query = SPARQL_TYPE_QUERY.format(qid=qid, limit=type_limit)
+        results = _sparql_get(query)
+        log.info("  Got %d results for %s", len(results), label)
+
+        for r in results:
+            wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
+            if wikidata_id in seen_ids:
+                continue
+            seen_ids[wikidata_id] = {
+                "name": r["itemLabel"]["value"],
+                "wikidata_id": wikidata_id,
+                "lat": float(r["lat"]["value"]),
+                "lon": float(r["lon"]["value"]),
+                "image_url": r["image"]["value"],
+                "_sitelinks": int(r["sitelinks"]["value"]),
+            }
+        # Be kind to the endpoint between type queries
+        time.sleep(2)
+
+    # Sort by sitelinks descending and take top `limit`
+    landmarks = sorted(seen_ids.values(), key=lambda x: x["_sitelinks"], reverse=True)[:limit]
+    for lm in landmarks:
+        del lm["_sitelinks"]
+
+    log.info("Deduplicated to %d unique landmarks (top %d kept)", len(landmarks), limit)
     return landmarks
 
 
-def download_image(url: str, max_width: int = 512) -> Path | None:
-    """Download a Wikimedia Commons image, resized via thumbnail API."""
-    # Use Wikimedia thumbnail API to get a resized version
+IMAGE_CACHE_DIR = Path.home() / ".cache/photo-tools/landmark-images"
+MIN_DELAY = 0.05   # seconds between requests (floor)
+MAX_DELAY = 10.0   # seconds between requests (ceiling)
+INITIAL_DELAY = 0.1
+DOWNLOAD_WORKERS = 2
+_rate_delay = INITIAL_DELAY
+_rate_lock = threading.Lock()
+
+
+def _adjust_rate(got_429: bool) -> None:
+    """Adjust download delay based on rate limit feedback."""
+    global _rate_delay
+    with _rate_lock:
+        if got_429:
+            _rate_delay = min(_rate_delay * 2, MAX_DELAY)
+            log.warning("Rate limited — backing off to %.1fs between requests", _rate_delay)
+        else:
+            _rate_delay = max(_rate_delay * 0.95, MIN_DELAY)
+
+
+def download_image(url: str, wikidata_id: str, max_width: int = 512) -> tuple[Path | None, bool]:
+    """Download a Wikimedia Commons image, resized via thumbnail API.
+
+    Images are cached in ~/.cache/photo-tools/landmark-images/ by Wikidata ID.
+    """
+    suffix = Path(urllib.parse.unquote(url.rsplit("/", 1)[-1])).suffix or ".jpg"
+    cached = IMAGE_CACHE_DIR / f"{wikidata_id}{suffix}"
+    if cached.exists() and cached.stat().st_size >= 1000:
+        return cached, True
+
     filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
     thumb_url = f"https://commons.wikimedia.org/w/thumb.php?f={urllib.parse.quote(filename)}&w={max_width}"
 
     try:
+        time.sleep(_rate_delay)
         resp = requests.get(
             thumb_url,
             headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
             timeout=30,
             stream=True,
         )
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 0))
+            if retry_after:
+                log.warning("Rate limited — Retry-After: %ds", retry_after)
+                time.sleep(retry_after)
+            else:
+                _adjust_rate(got_429=True)
+            return None, False
+        _adjust_rate(got_429=False)
         resp.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        for chunk in resp.iter_content(8192):
-            tmp.write(chunk)
-        tmp.close()
-        if Path(tmp.name).stat().st_size < 1000:
-            Path(tmp.name).unlink()
-            return None
-        return Path(tmp.name)
+        IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+        if tmp.stat().st_size < 1000:
+            tmp.unlink()
+            return None, False
+        tmp.rename(cached)
+        return cached, False
     except Exception as e:
         log.debug("Failed to download %s: %s", filename, e)
-        return None
+        return None, False
 
 
 def build_database(
@@ -136,6 +207,7 @@ def build_database(
     clip_model: str,
     clip_pretrained: str,
     resume: bool,
+    wikidata_cache: Path | None = None,
 ) -> None:
     from clip_tagger import CLIPTagger
 
@@ -148,28 +220,69 @@ def build_database(
             existing[lm["wikidata_id"]] = lm
         log.info("Resuming: %d landmarks already computed", len(existing))
 
-    landmarks = query_wikidata(limit)
+    if wikidata_cache and wikidata_cache.exists():
+        with open(wikidata_cache) as f:
+            landmarks = json.load(f)[:limit]
+        log.info("Loaded %d landmarks from %s", len(landmarks), wikidata_cache)
+    else:
+        landmarks = query_wikidata(limit)
+        # Dump deduped Wikidata entries for future re-use
+        dump_path = output_path.with_suffix(".wikidata.json")
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(dump_path, "w") as f:
+            json.dump(landmarks, f, indent=2)
+        log.info("Dumped %d Wikidata entries to %s", len(landmarks), dump_path)
+
+    # Phase 1: download all images (2 workers)
+    to_download = [lm for lm in landmarks if lm["wikidata_id"] not in existing or not existing[lm["wikidata_id"]].get("embedding")]
+    total = len(to_download)
+    download_failed = 0
+    cached_count = 0
+    downloaded_count = 0
+    done_count = 0
+    image_paths: dict[str, Path] = {}
+
+    def _download(lm: dict) -> tuple[str, str, Path | None, bool]:
+        wid = lm["wikidata_id"]
+        img_path, was_cached = download_image(lm["image_url"], wid)
+        return wid, lm["name"], img_path, was_cached
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [pool.submit(_download, lm) for lm in to_download]
+        for future in as_completed(futures):
+            wid, name, img_path, was_cached = future.result()
+            done_count += 1
+            if img_path is not None:
+                image_paths[wid] = img_path
+                if was_cached:
+                    cached_count += 1
+                else:
+                    downloaded_count += 1
+            else:
+                download_failed += 1
+            print(f"\r  images [{done_count}/{total}] {downloaded_count} new, {cached_count} cached, {download_failed} failed — {name:<40}", end="", flush=True, file=sys.stderr)
+    print(file=sys.stderr)
+    log.info("Images: %d downloaded, %d from cache, %d failed", downloaded_count, cached_count, download_failed)
+
+    # Phase 2: embed
     tagger = CLIPTagger(model_name=clip_model, pretrained=clip_pretrained)
 
     results = []
-    total = len(landmarks)
-    failed = 0
+    embed_failed = 0
 
     for i, lm in enumerate(landmarks, 1):
         wid = lm["wikidata_id"]
 
-        # Resume: reuse existing embedding
         if wid in existing and existing[wid].get("embedding"):
             results.append(existing[wid])
-            print(f"\r  [{i}/{total}] {lm['name']} (cached)", end="", flush=True, file=sys.stderr)
+            print(f"\r  embedding [{i}/{total}] {lm['name']} (cached)", end="", flush=True, file=sys.stderr)
             continue
 
-        print(f"\r  [{i}/{total}] {lm['name']:<50}", end="", flush=True, file=sys.stderr)
-
-        img_path = download_image(lm["image_url"])
+        img_path = image_paths.get(wid)
         if img_path is None:
-            failed += 1
             continue
+
+        print(f"\r  embedding [{i}/{total}] {lm['name']:<50}", end="", flush=True, file=sys.stderr)
 
         try:
             _, embedding = tagger.tag_image(img_path)
@@ -182,15 +295,7 @@ def build_database(
             })
         except Exception as e:
             log.debug("Failed to embed %s: %s", lm["name"], e)
-            failed += 1
-        finally:
-            try:
-                img_path.unlink()
-            except OSError:
-                pass
-
-        # Rate limit to be kind to Wikimedia
-        time.sleep(0.2)
+            embed_failed += 1
 
         # Periodic save every 500 landmarks
         if i % 500 == 0:
@@ -198,7 +303,8 @@ def build_database(
 
     print(file=sys.stderr)
     _save(output_path, clip_model, clip_pretrained, results)
-    log.info("Done. %d landmarks saved, %d failed", len(results), failed)
+    log.info("Done. %d landmarks saved, %d download failed, %d embed failed",
+             len(results), download_failed, embed_failed)
 
 
 def _save(output_path: Path, model: str, pretrained: str, landmarks: list[dict]):
@@ -221,6 +327,8 @@ def main():
     parser.add_argument("--clip-pretrained", default="laion2b_s34b_b79k")
     parser.add_argument("--resume", action="store_true",
                         help="Skip landmarks already in output file")
+    parser.add_argument("--wikidata-cache", type=Path, metavar="PATH",
+                        help="Load landmarks from a previous .wikidata.json instead of querying")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -233,6 +341,7 @@ def main():
         clip_model=args.clip_model,
         clip_pretrained=args.clip_pretrained,
         resume=args.resume,
+        wikidata_cache=args.wikidata_cache,
     )
 
 
