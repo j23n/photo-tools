@@ -183,7 +183,7 @@ def get_existing_keywords(exif: dict) -> set[str]:
         if isinstance(val, str):
             keywords.add(val.lower())
         elif isinstance(val, list):
-            keywords.update(v.lower() for v in val)
+            keywords.update(str(v).lower() for v in val)
     return keywords
 
 
