@@ -159,7 +159,7 @@ def read_exif(path: Path) -> dict:
         "-EXIF:Flash",
         "-EXIF:ImageWidth", "-EXIF:ImageHeight",
         "-File:ImageWidth", "-File:ImageHeight",
-        "-IPTC:Keywords", "-XMP:Subject",
+        "-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList",
         "-n",
     ]
     try:
@@ -178,7 +178,7 @@ def read_exif(path: Path) -> dict:
 
 def get_existing_keywords(exif: dict) -> set[str]:
     keywords = set()
-    for field in ("Keywords", "Subject"):
+    for field in ("Keywords", "Subject", "TagsList"):
         val = exif.get(field, [])
         if isinstance(val, str):
             keywords.add(val.lower())
@@ -200,7 +200,7 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
         batch = paths[i:i + BATCH_SIZE]
         try:
             proc = subprocess.run(
-                ["exiftool", "-j", "-IPTC:Keywords", "-XMP:Subject"]
+                ["exiftool", "-j", "-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList"]
                 + [str(p) for p in batch],
                 capture_output=True, text=True, timeout=120,
             )
@@ -259,6 +259,12 @@ def clear_our_tags(path: Path, existing: set[str], dry_run: bool = False) -> boo
         args.append(f"-XMP-dc:Subject-={tag}")
         args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(tag)}")
         args.append(f"-XMP-digiKam:TagsList-={tag}")
+        # DigiKam flattens hierarchical tags to just the leaf in Keywords/Subject,
+        # so also remove the leaf form (e.g. "midday" for "time/midday")
+        leaf = tag.rsplit("/", 1)[-1]
+        if leaf != tag:
+            args.append(f"-IPTC:Keywords-={leaf}")
+            args.append(f"-XMP-dc:Subject-={leaf}")
     args.append(str(path))
 
     try:
@@ -1188,7 +1194,9 @@ def process_single(
     # --force: remove only tags we recognize as ours
     elif force and existing:
         clear_our_tags(path, existing, dry_run)
-        existing = {t for t in existing if not is_our_tag(t)}
+        our_tags = {t for t in existing if is_our_tag(t)}
+        our_leaves = {t.rsplit("/", 1)[-1] for t in our_tags if "/" in t}
+        existing = existing - our_tags - our_leaves
 
     log.info("Processing %s ...", path.name)
     all_tags = []
