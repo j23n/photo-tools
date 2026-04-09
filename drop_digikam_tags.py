@@ -33,7 +33,7 @@ from pathlib import Path
 ALL_PREFIXES = (
     "country/", "cc/", "region/", "city/", "neighborhood/",
     "landmark/", "scene/", "setting/",
-    "object/", "animal/", "plant/", "vehicle/", "food/",
+    "object/", "animal/", "plant/", "vehicle/", "food/", "other/",
     "activity/", "event/",
     "weather/", "time/",
     "text/",
