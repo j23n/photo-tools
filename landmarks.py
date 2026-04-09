@@ -2,7 +2,7 @@
 landmarks.py — FAISS-based landmark lookup using CLIP embeddings.
 
 Loads a landmarks.json database (built by build_landmarks.py) and provides
-fast cosine-similarity search, optionally filtered by GPS radius.
+fast cosine-similarity search filtered by GPS radius.
 """
 
 import json
@@ -44,34 +44,27 @@ class LandmarkIndex:
         self.lats = np.array([lm["lat"] for lm in self.landmarks], dtype=np.float64)
         self.lons = np.array([lm["lon"] for lm in self.landmarks], dtype=np.float64)
 
-        # Build FAISS index (inner product = cosine similarity on L2-normalized vectors)
-        embeddings = np.array(
+        self._embeddings = np.array(
             [lm["embedding"] for lm in self.landmarks], dtype=np.float32,
         )
-        dim = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)
-        self.index.add(embeddings)
-        self._embeddings = embeddings
 
-        log.info("Loaded %d landmarks (dim=%d)", len(self.landmarks), dim)
+        log.info("Loaded %d landmarks (dim=%d)", len(self.landmarks), self._embeddings.shape[1])
 
     def lookup(
         self,
         embedding: np.ndarray,
-        lat: float | None = None,
-        lon: float | None = None,
+        lat: float,
+        lon: float,
         radius_km: float = 50.0,
         threshold: float = 0.55,
-        no_gps_threshold: float = 0.65,
     ) -> str | None:
         """Find the best matching landmark for an image embedding.
 
         Args:
             embedding: L2-normalized CLIP image embedding.
-            lat, lon: GPS coordinates of the photo (optional).
+            lat, lon: GPS coordinates of the photo.
             radius_km: Only consider landmarks within this radius of GPS coords.
-            threshold: Minimum cosine similarity to return a match (with GPS).
-            no_gps_threshold: Higher threshold when no GPS is available.
+            threshold: Minimum cosine similarity to return a match.
 
         Returns:
             Landmark name or None.
@@ -80,46 +73,30 @@ class LandmarkIndex:
 
         embedding = embedding.reshape(1, -1).astype(np.float32)
 
-        if lat is not None and lon is not None:
-            # Filter to landmarks within GPS radius, then search that subset
-            distances = np.array([
-                _haversine_km(lat, lon, self.lats[i], self.lons[i])
-                for i in range(len(self.landmarks))
-            ])
-            nearby_mask = distances <= radius_km
-            nearby_indices = np.where(nearby_mask)[0]
+        distances = np.array([
+            _haversine_km(lat, lon, self.lats[i], self.lons[i])
+            for i in range(len(self.landmarks))
+        ])
+        nearby_indices = np.where(distances <= radius_km)[0]
 
-            if len(nearby_indices) == 0:
-                log.debug("No landmarks within %.0f km of (%.4f, %.4f)",
-                          radius_km, lat, lon)
-                return None
-
-            # Build a temporary index with only nearby landmarks
-            nearby_embeddings = self._embeddings[nearby_indices]
-            dim = nearby_embeddings.shape[1]
-            tmp_index = faiss.IndexFlatIP(dim)
-            tmp_index.add(nearby_embeddings)
-
-            k = min(5, len(nearby_indices))
-            scores, local_indices = tmp_index.search(embedding, k)
-            log.debug("Landmark top-%d nearby (within %.0f km): %s",
-                      k, radius_km,
-                      [(self.names[nearby_indices[local_indices[0, j]]],
-                        f"{scores[0, j]:.3f}")
-                       for j in range(k)])
-            score = scores[0, 0]
-            if score >= threshold:
-                global_idx = nearby_indices[local_indices[0, 0]]
-                return self.names[global_idx]
+        if len(nearby_indices) == 0:
+            log.debug("No landmarks within %.0f km of (%.4f, %.4f)",
+                      radius_km, lat, lon)
             return None
 
-        # No GPS: search full index with a stricter threshold
-        scores, indices = self.index.search(embedding, 5)
-        log.debug("Landmark top-5 global (no GPS, threshold=%.2f): %s",
-                  no_gps_threshold,
-                  [(self.names[indices[0, j]], f"{scores[0, j]:.3f}")
-                   for j in range(5)])
-        score = scores[0, 0]
-        if score >= no_gps_threshold:
-            return self.names[indices[0, 0]]
+        nearby_embeddings = self._embeddings[nearby_indices]
+        dim = nearby_embeddings.shape[1]
+        tmp_index = faiss.IndexFlatIP(dim)
+        tmp_index.add(nearby_embeddings)
+
+        k = min(5, len(nearby_indices))
+        scores, local_indices = tmp_index.search(embedding, k)
+        log.debug("Landmark top-%d nearby (within %.0f km): %s",
+                  k, radius_km,
+                  [(self.names[nearby_indices[local_indices[0, j]]],
+                    f"{scores[0, j]:.3f}")
+                   for j in range(k)])
+        if scores[0, 0] >= threshold:
+            global_idx = nearby_indices[local_indices[0, 0]]
+            return self.names[global_idx]
         return None

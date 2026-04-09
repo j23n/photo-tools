@@ -1253,10 +1253,10 @@ def process_single(
                 except OSError:
                     pass
 
-        # Landmark lookup using the CLIP embedding
-        if embedding is not None:
-            coords = get_gps_coords(exif) or gps_fallback
-            lat, lon = coords if coords else (None, None)
+        # Landmark lookup using the CLIP embedding (requires GPS)
+        coords = (get_gps_coords(exif) or gps_fallback) if embedding is not None else None
+        if embedding is not None and coords is not None:
+            lat, lon = coords
             try:
                 lm_index = _get_landmark_index(landmarks_path)
                 if lm_index is not None:
