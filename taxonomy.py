@@ -13,15 +13,15 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 CATEGORY_CONFIG = {
-    "animal":   {"prefix": "animal/",   "max_tags": 2, "threshold": 0.40},
-    "food":     {"prefix": "food/",     "max_tags": 3, "threshold": 0.30},
-    "plant":    {"prefix": "plant/",    "max_tags": 2, "threshold": 0.40},
-    "vehicle":  {"prefix": "vehicle/",  "max_tags": 2, "threshold": 0.45},
-    "object":   {"prefix": "object/",   "max_tags": 3, "threshold": 0.25},
-    "scene":    {"prefix": "scene/",    "max_tags": 2, "threshold": 0.25},
-    "activity": {"prefix": "activity/", "max_tags": 2, "threshold": 0.30},
-    "event":    {"prefix": "event/",    "max_tags": 1, "threshold": 0.45},
-    "other":    {"prefix": "other/",    "max_tags": 2, "threshold": 0.30},
+    "animal":   {"prefix": "animal/",   "max_tags": 2},
+    "food":     {"prefix": "food/",     "max_tags": 3},
+    "plant":    {"prefix": "plant/",    "max_tags": 2},
+    "vehicle":  {"prefix": "vehicle/",  "max_tags": 2},
+    "object":   {"prefix": "object/",   "max_tags": 3},
+    "scene":    {"prefix": "scene/",    "max_tags": 2},
+    "activity": {"prefix": "activity/", "max_tags": 2},
+    "event":    {"prefix": "event/",    "max_tags": 1},
+    "other":    {"prefix": "other/",    "max_tags": 2},
 }
 
 # ---------------------------------------------------------------------------
