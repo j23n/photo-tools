@@ -1,14 +1,15 @@
 """Interactive image debug viewer for inspecting tags and landmarks.
 
-Uses ``kitten icat`` (Kitty terminal) to display images inline while showing
-metadata (tags, landmarks, GPS, taken_at) below.  Navigate with arrow keys,
-quit with ``q``.
+Opens images in the system viewer (``xdg-open`` / ``open``) while showing
+metadata (tags, landmarks, GPS, taken_at) in the terminal.  Navigate with
+arrow keys, quit with ``q``.
 """
 
 import argparse
 import logging
 import os
 import platform
+import signal
 import shutil
 import subprocess
 import sys
@@ -26,14 +27,28 @@ log = logging.getLogger("inspect")
 # Image display backends
 # ---------------------------------------------------------------------------
 
-def _in_kitty() -> bool:
-    """Return True if running inside a Kitty terminal."""
-    return (os.environ.get("TERM", "") == "xterm-kitty"
-            or os.environ.get("TERM_PROGRAM", "") == "kitty")
-
-
 def _find_opener() -> list[str] | None:
-    """Return the command for the system image opener, or None."""
+    """Return the command for the system image opener, or None.
+
+    Prefers simple viewers that stay as a child process so we can kill
+    them on navigation.  ``xdg-open`` and GNOME apps delegate via D-Bus,
+    making the actual viewer unkillable.
+
+    Viewers are configured to show a reasonably-sized thumbnail rather
+    than the full image.
+    """
+    thumb = "800x600>"
+    candidates: list[tuple[str, list[str]]] = [
+        ("feh",         ["feh", "--scale-down", "--geometry", "800x600"]),
+        ("imv",         ["imv", "-s", "shrink"]),
+        ("imv-wayland", ["imv-wayland", "-s", "shrink"]),
+        ("nsxiv",       ["nsxiv", "-g", "800x600"]),
+        ("sxiv",        ["sxiv", "-g", "800x600"]),
+        ("display",     ["display", "-auto-orient", "-resize", thumb]),
+    ]
+    for cmd, argv in candidates:
+        if shutil.which(cmd):
+            return argv
     if platform.system() == "Darwin":
         return ["open"]
     if shutil.which("xdg-open"):
@@ -59,8 +74,8 @@ def _load_metadata(path: Path) -> dict:
         "path": str(path.resolve()),
         "gps": f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "\u2014",
         "taken_at": taken_at.strftime("%Y-%m-%d %H:%M") if taken_at else "\u2014",
-        "landmarks": ", ".join(landmarks) if landmarks else "\u2014",
-        "tags": ", ".join(tags) if tags else "\u2014",
+        "landmarks": landmarks,
+        "tags": tags,
     }
 
 
@@ -68,15 +83,18 @@ def _load_metadata(path: Path) -> dict:
 # Terminal display
 # ---------------------------------------------------------------------------
 
-def _display_kitty(path: Path, meta: dict, index: int, total: int) -> None:
-    """Display image inline via kitten icat and print metadata."""
-    sys.stdout.write("\x1b[2J\x1b[H")
-    sys.stdout.flush()
-
-    subprocess.run(["kitten", "icat", "--clear"], capture_output=True)
-    subprocess.run(["kitten", "icat", str(path)], capture_output=False)
-
-    _print_meta(meta, index, total)
+def _kill_viewer(proc: subprocess.Popen) -> None:
+    """Terminate the viewer process group, falling back to direct kill."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=2)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _display_external(
@@ -93,14 +111,7 @@ def _display_external(
     Returns the new Popen handle so the caller can track it.
     """
     if prev_proc is not None:
-        try:
-            prev_proc.terminate()
-            prev_proc.wait(timeout=2)
-        except Exception:
-            try:
-                prev_proc.kill()
-            except Exception:
-                pass
+        _kill_viewer(prev_proc)
 
     sys.stdout.write("\x1b[2J\x1b[H")
     sys.stdout.flush()
@@ -109,21 +120,46 @@ def _display_external(
         opener + [str(path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
     _print_meta(meta, index, total)
     return proc
 
 
+def _truncate(text: str, width: int) -> str:
+    """Truncate *text* to *width* columns, adding ellipsis if needed."""
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "\u2026"
+
+
 def _print_meta(meta: dict, index: int, total: int) -> None:
-    print()
-    print(f"  [{index + 1}/{total}] {meta['path']}")
-    print(f"  Taken:     {meta['taken_at']}")
-    print(f"  GPS:       {meta['gps']}")
-    print(f"  Landmarks: {meta['landmarks']}")
-    print(f"  Tags:      {meta['tags']}")
-    print()
-    print("  [\u2190] prev   [\u2192] next   [q] quit")
+    """Print image metadata, safe for raw-terminal mode."""
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+
+    lines = [
+        "",
+        f"  [{index + 1}/{total}] {meta['path']}",
+        f"  Taken:  {meta['taken_at']}",
+        f"  GPS:    {meta['gps']}",
+    ]
+    if meta["landmarks"]:
+        lines.append("  Landmarks:")
+        for lm in meta["landmarks"]:
+            lines.append(f"    {lm}")
+    if meta["tags"]:
+        lines.append("  Tags:")
+        for tag in meta["tags"]:
+            lines.append(f"    {tag}")
+    lines += ["", "  [\u2190] prev   [\u2192] next   [q] quit"]
+
+    for line in lines:
+        sys.stdout.write(_truncate(line, cols) + "\r\n")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +193,11 @@ def _read_key() -> str:
 
 def _interactive_loop(images: list[Path]) -> None:
     """Cycle through images with arrow keys, quit with q."""
-    use_kitty = _in_kitty()
-    opener = None if use_kitty else _find_opener()
+    opener = _find_opener()
 
-    if not use_kitty and opener is None:
+    if opener is None:
         log.error(
-            "No image display method available. "
-            "Run inside Kitty terminal, or install xdg-open."
+            "No image viewer found. Install xdg-open (or run on macOS)."
         )
         sys.exit(1)
 
@@ -177,12 +211,9 @@ def _interactive_loop(images: list[Path]) -> None:
         tty.setraw(fd)
         while True:
             meta = _load_metadata(images[idx])
-            if use_kitty:
-                _display_kitty(images[idx], meta, idx, total)
-            else:
-                viewer_proc = _display_external(
-                    images[idx], meta, idx, total, opener, viewer_proc,
-                )
+            viewer_proc = _display_external(
+                images[idx], meta, idx, total, opener, viewer_proc,
+            )
             key = _read_key()
             if key == "q":
                 break
@@ -192,17 +223,8 @@ def _interactive_loop(images: list[Path]) -> None:
                 idx = (idx - 1) % total
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        if use_kitty:
-            subprocess.run(["kitten", "icat", "--clear"], capture_output=True)
-        elif viewer_proc is not None:
-            try:
-                viewer_proc.terminate()
-                viewer_proc.wait(timeout=2)
-            except Exception:
-                try:
-                    viewer_proc.kill()
-                except Exception:
-                    pass
+        if viewer_proc is not None:
+            _kill_viewer(viewer_proc)
         sys.stdout.write("\x1b[2J\x1b[H")
         sys.stdout.flush()
 

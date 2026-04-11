@@ -279,7 +279,7 @@ except ImportError:
     _HAVE_PILLOW_HEIF = False
 
 try:
-    from PIL import Image as PILImage
+    from PIL import Image as PILImage, ImageOps
     _HAVE_PILLOW = True
 except ImportError:
     _HAVE_PILLOW = False
@@ -293,6 +293,7 @@ def _try_pillow(path: Path, tmp_path: str, max_pixels: int) -> bool:
     try:
         cfg = get_config()
         img = PILImage.open(str(path))
+        ImageOps.exif_transpose(img, in_place=True)
         img.thumbnail((max_pixels, max_pixels), PILImage.LANCZOS)
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")

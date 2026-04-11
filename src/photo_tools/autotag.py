@@ -339,8 +339,9 @@ def _get_ocr_engine():
 
 def _get_image_dimensions(path) -> tuple[int | None, int | None]:
     try:
-        from PIL import Image as PILImage
+        from PIL import Image as PILImage, ImageOps
         with PILImage.open(str(path)) as img:
+            ImageOps.exif_transpose(img, in_place=True)
             return img.size
     except Exception:
         return None, None

@@ -1746,10 +1746,7 @@
     "category": "scene",
     "tag": "boxing-ring"
   },
-  "boy": {
-    "category": "other",
-    "tag": "child"
-  },
+  "boy": null,
   "brace": null,
   "bracket": null,
   "braid": null,
@@ -2267,10 +2264,7 @@
     "category": "object",
     "tag": "bridge"
   },
-  "canvas": {
-    "category": "object",
-    "tag": "painting"
-  },
+  "canvas": null,
   "canyon": {
     "category": "scene",
     "tag": "canyon"
@@ -2750,14 +2744,8 @@
     "category": "animal",
     "tag": "dog"
   },
-  "child": {
-    "category": "other",
-    "tag": "child"
-  },
-  "child actor": {
-    "category": "other",
-    "tag": "child"
-  },
+  "child": null,
+  "child actor": null,
   "childs room": {
     "category": "scene",
     "tag": "bedroom"
@@ -4001,10 +3989,7 @@
     "category": "object",
     "tag": "decoration"
   },
-  "decorative picture": {
-    "category": "object",
-    "tag": "painting"
-  },
+  "decorative picture": null,
   "deer": {
     "category": "animal",
     "tag": "deer"
@@ -5835,10 +5820,7 @@
     "category": "animal",
     "tag": "giraffe"
   },
-  "girl": {
-    "category": "other",
-    "tag": "child"
-  },
+  "girl": null,
   "give": null,
   "glacier": {
     "category": "scene",
@@ -9650,10 +9632,7 @@
     "category": "object",
     "tag": "table"
   },
-  "picture": {
-    "category": "object",
-    "tag": "painting"
-  },
+  "picture": null,
   "picture frame": {
     "category": "object",
     "tag": "picture-frame"
@@ -11404,10 +11383,7 @@
     "category": "vehicle",
     "tag": "segway"
   },
-  "selfie": {
-    "category": "activity",
-    "tag": "selfie"
-  },
+  "selfie": null,
   "sell": null,
   "seminar": {
     "category": "event",
@@ -13136,7 +13112,7 @@
   },
   "toddler": {
     "category": "other",
-    "tag": "child"
+    "tag": "baby"
   },
   "toe": null,
   "tofu": {

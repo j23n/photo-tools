@@ -64,10 +64,10 @@ class RAMTagger:
     def tag_image(self, image_path: Path) -> list[str]:
         """Tag an image using RAM++."""
         import torch
-        from PIL import Image as PILImage
+        from PIL import Image as PILImage, ImageOps
         from ram import inference_ram
 
-        img = PILImage.open(str(image_path)).convert("RGB")
+        img = ImageOps.exif_transpose(PILImage.open(str(image_path))).convert("RGB")
         img_tensor = self.transform(img).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
