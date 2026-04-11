@@ -5,10 +5,6 @@ Defines the hierarchical tag categories used by the autotagging pipeline.
 RAM++ tags are mapped to these categories via ram_tag_mapping.json.
 """
 
-# ---------------------------------------------------------------------------
-# Per-category configuration
-# ---------------------------------------------------------------------------
-
 CATEGORY_CONFIG = {
     "animal":   {"prefix": "animal/",   "max_tags": 2},
     "food":     {"prefix": "food/",     "max_tags": 3},
@@ -28,3 +24,9 @@ CATEGORY_CONFIG = {
 def get_all_categories() -> list[str]:
     """Return all category names."""
     return list(CATEGORY_CONFIG.keys())
+
+
+def get_max_tags(category: str) -> int:
+    """Return max tags for a category (default 2)."""
+    entry = CATEGORY_CONFIG.get(category)
+    return entry["max_tags"] if entry else 2
