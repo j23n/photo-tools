@@ -8,8 +8,12 @@ Subcommands:
 
 import argparse
 import logging
+import math
 import os
 import sys
+import tempfile
+import termios
+import tty
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +21,7 @@ import numpy as np
 
 from photo_tools.config import get_config
 from photo_tools.constants import IMAGE_EXTENSIONS
+from photo_tools.debug_viewer import _find_opener, _kill_viewer, _read_key, _truncate
 from photo_tools.helpers import (
     add_tags,
     find_images,
@@ -158,58 +163,261 @@ def move_to_dest(path: Path, dest_root: Path) -> None:
     log.info("Moved %s -> %s", path.name, dest)
 
 
+def _create_contact_sheet(paths: list[Path], thumb_size: int = 200) -> Path:
+    """Create a numbered thumbnail grid and return the path to a temp JPEG."""
+    from PIL import Image as PILImage, ImageDraw, ImageFont, ImageOps
+
+    n = len(paths)
+    cols = min(n, math.ceil(math.sqrt(n)))
+    rows = math.ceil(n / cols)
+
+    cell_w = thumb_size
+    cell_h = thumb_size
+    label_h = 20
+    sheet_w = cols * cell_w
+    sheet_h = rows * (cell_h + label_h)
+
+    sheet = PILImage.new("RGB", (sheet_w, sheet_h), (32, 32, 32))
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/liberation-mono/LiberationMono-Bold.ttf", 14)
+    except OSError:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+        except OSError:
+            font = ImageFont.load_default()
+
+    for idx, path in enumerate(paths):
+        col = idx % cols
+        row = idx // cols
+        x0 = col * cell_w
+        y0 = row * (cell_h + label_h)
+
+        try:
+            img = PILImage.open(str(path))
+            ImageOps.exif_transpose(img, in_place=True)
+            img.thumbnail((cell_w - 4, cell_h - 4), PILImage.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            # Centre the thumbnail in the cell
+            ox = x0 + (cell_w - img.width) // 2
+            oy = y0 + (cell_h - img.height) // 2
+            sheet.paste(img, (ox, oy))
+        except Exception:
+            # Draw a placeholder
+            draw.rectangle([x0 + 2, y0 + 2, x0 + cell_w - 2, y0 + cell_h - 2],
+                           outline=(100, 100, 100))
+
+        # Number label below thumbnail
+        label = str(idx)
+        lx = x0 + cell_w // 2
+        ly = y0 + cell_h + 2
+        draw.text((lx, ly), label, fill=(255, 255, 255), font=font, anchor="mt")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
+    sheet.save(tmp.name, "JPEG", quality=92)
+    return Path(tmp.name)
+
+
+def _print_cluster_ui(
+    paths: list[Path],
+    keep: list[bool],
+    sim_matrix: np.ndarray,
+    cursor: int,
+    cluster_idx: int,
+    total_clusters: int,
+    dry_run: bool,
+    zoomed: bool,
+) -> None:
+    """Render the terminal UI for one cluster."""
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+
+    lines = [
+        "",
+        f"  Cluster {cluster_idx + 1}/{total_clusters}  ({len(paths)} photos)"
+        + ("  [DRY RUN]" if dry_run else ""),
+        "",
+    ]
+    for j, path in enumerate(paths):
+        size_mb = path.stat().st_size / 1_048_576
+        mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        marker = "KEEP" if keep[j] else "MOVE"
+        pointer = "\u25b6" if j == cursor else " "
+        if j == 0:
+            sim_str = "       "
+        else:
+            max_sim = max(sim_matrix[j, k] for k in range(j))
+            sim_str = f"  {max_sim:.3f}"
+        line = f"  {pointer} [{marker}] [{j}] {path.name}{sim_str}  {mtime}  {size_mb:.1f} MB"
+        lines.append(line)
+
+    lines.append("")
+    if zoomed:
+        lines.append("  Zoomed on image — press any key to return to overview")
+    else:
+        lines += [
+            "  [\u2191\u2193] select  [space] toggle  [a] keep all  [d] keep first only",
+            "  [\u2190\u2192] prev/next cluster  [enter] confirm & next  [z] zoom  [q] quit",
+        ]
+
+    sys.stdout.write("\x1b[2J\x1b[H")
+    for line in lines:
+        sys.stdout.write(_truncate(line, cols) + "\r\n")
+    sys.stdout.flush()
+
+
+def _apply_moves(
+    paths: list[Path],
+    keep: list[bool],
+    dest_root: Path,
+    dry_run: bool,
+) -> int:
+    """Move non-kept images to dest. Returns count of moved files."""
+    moved = 0
+    for j, path in enumerate(paths):
+        if not keep[j]:
+            if dry_run:
+                log.info("[DRY RUN] Would move %s -> %s", path.name, dest_root)
+            else:
+                move_to_dest(path, dest_root)
+            moved += 1
+    return moved
+
+
 def interactive_similar_session(
     clusters: list[list[Path]],
     dest_root: Path,
     dry_run: bool,
     embeddings: dict[Path, np.ndarray],
 ) -> None:
-    total = len(clusters)
-    for i, cluster in enumerate(clusters, 1):
-        paths_list = list(cluster)
-        matrix = np.stack([embeddings[p] for p in paths_list])
-        sim_matrix = matrix @ matrix.T
+    import subprocess
 
-        print(f"\nCluster {i}/{total}  ({len(cluster)} photos)")
-        for j, path in enumerate(paths_list):
-            size_mb = path.stat().st_size / 1_048_576
-            mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            if j == 0:
-                print(f"  [KEEP] [{j}] {path.name}  {mtime}  {size_mb:.1f} MB")
-            else:
-                max_sim = max(sim_matrix[j, k] for k in range(j))
-                print(f"         [{j}] {path.name}  sim={max_sim:.3f}  {size_mb:.1f} MB")
+    opener = _find_opener(geometry="+0+0")
+    if opener is None:
+        log.error("No image viewer found. Install feh, imv, nsxiv, or similar.")
+        sys.exit(1)
 
-        print("  [k]eep all  [d]move all but first  [s]elect indices to keep  [skip]")
-        while True:
-            choice = input("  > ").strip().lower()
-            if choice in ("skip", ""):
-                break
-            elif choice == "k":
-                break
-            elif choice == "d":
-                for path in paths_list[1:]:
-                    if dry_run:
-                        log.info("[DRY RUN] Would move %s -> %s", path.name, dest_root)
-                    else:
-                        move_to_dest(path, dest_root)
-                break
-            elif choice == "s":
-                raw = input("  Keep indices (space-separated): ").strip()
+    total_clusters = len(clusters)
+    cluster_idx = 0
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    viewer_proc: subprocess.Popen | None = None
+    sheet_path: Path | None = None
+    moved_total = 0
+
+    try:
+        tty.setraw(fd)
+
+        while 0 <= cluster_idx < total_clusters:
+            paths_list = list(clusters[cluster_idx])
+            matrix = np.stack([embeddings[p] for p in paths_list])
+            sim_matrix = matrix @ matrix.T
+            keep = [True] * len(paths_list)
+            cursor = 0
+            zoomed = False
+
+            # Generate and show contact sheet
+            if sheet_path:
                 try:
-                    keep = {int(x) for x in raw.split()}
-                except ValueError:
-                    print("  Invalid input, skipping.")
+                    os.unlink(sheet_path)
+                except OSError:
+                    pass
+            sheet_path = _create_contact_sheet(paths_list)
+
+            def _show_viewer(target: Path):
+                nonlocal viewer_proc
+                if viewer_proc is not None:
+                    _kill_viewer(viewer_proc)
+                viewer_proc = subprocess.Popen(
+                    opener + [str(target)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+
+            _show_viewer(sheet_path)
+            _print_cluster_ui(
+                paths_list, keep, sim_matrix, cursor,
+                cluster_idx, total_clusters, dry_run, zoomed,
+            )
+
+            while True:
+                key = _read_key()
+
+                if key == "q":
+                    # Apply pending moves before quitting
+                    moved_total += _apply_moves(paths_list, keep, dest_root, dry_run)
+                    cluster_idx = -1  # signal exit
                     break
-                for j, path in enumerate(paths_list):
-                    if j not in keep:
-                        if dry_run:
-                            log.info("[DRY RUN] Would move %s -> %s", path.name, dest_root)
-                        else:
-                            move_to_dest(path, dest_root)
-                break
-            else:
-                print("  Unknown choice. Use k/d/s/skip")
+
+                if zoomed:
+                    # Any key returns to overview
+                    zoomed = False
+                    _show_viewer(sheet_path)
+                    _print_cluster_ui(
+                        paths_list, keep, sim_matrix, cursor,
+                        cluster_idx, total_clusters, dry_run, zoomed,
+                    )
+                    continue
+
+                if key == "up":
+                    cursor = (cursor - 1) % len(paths_list)
+                elif key == "down":
+                    cursor = (cursor + 1) % len(paths_list)
+                elif key == " ":
+                    keep[cursor] = not keep[cursor]
+                elif key == "a":
+                    keep = [True] * len(paths_list)
+                elif key == "d":
+                    keep = [True] + [False] * (len(paths_list) - 1)
+                elif key == "z" or key == "\r":
+                    if key == "z":
+                        zoomed = True
+                        _show_viewer(paths_list[cursor])
+                    else:
+                        # Enter = confirm and move to next
+                        moved_total += _apply_moves(paths_list, keep, dest_root, dry_run)
+                        cluster_idx += 1
+                        break
+                elif key == "right":
+                    # Next cluster without confirming (skip)
+                    cluster_idx += 1
+                    break
+                elif key == "left":
+                    cluster_idx = max(0, cluster_idx - 1)
+                    break
+                else:
+                    # Try digit keys for quick toggle
+                    if key.isdigit():
+                        idx = int(key)
+                        if idx < len(paths_list):
+                            cursor = idx
+                            keep[cursor] = not keep[cursor]
+                    continue  # unknown key, skip redraw
+
+                _print_cluster_ui(
+                    paths_list, keep, sim_matrix, cursor,
+                    cluster_idx, total_clusters, dry_run, zoomed,
+                )
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if viewer_proc is not None:
+            _kill_viewer(viewer_proc)
+        if sheet_path:
+            try:
+                os.unlink(sheet_path)
+            except OSError:
+                pass
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+        if moved_total:
+            action = "Would move" if dry_run else "Moved"
+            print(f"{action} {moved_total} image(s) to {dest_root}")
 
 
 # ---------------------------------------------------------------------------

@@ -27,24 +27,31 @@ log = logging.getLogger("inspect")
 # Image display backends
 # ---------------------------------------------------------------------------
 
-def _find_opener() -> list[str] | None:
+def _find_opener(geometry: str = "800x600") -> list[str] | None:
     """Return the command for the system image opener, or None.
 
     Prefers simple viewers that stay as a child process so we can kill
     them on navigation.  ``xdg-open`` and GNOME apps delegate via D-Bus,
     making the actual viewer unkillable.
 
-    Viewers are configured to show a reasonably-sized thumbnail rather
-    than the full image.
+    *geometry* is an X11 geometry string, e.g. ``"800x600"`` (size only),
+    ``"+0+0"`` (position only), or ``"800x600+0+0"`` (both).
     """
-    thumb = "800x600>"
+    # Extract size portion (before any +) for ImageMagick -resize
+    size_part = geometry.split("+")[0]  # "" when geometry is "+0+0"
+    resize = (size_part + ">") if size_part else "800x600>"
+
+    display_args = ["display", "-auto-orient", "-resize", resize]
+    if "+" in geometry:
+        display_args += ["-geometry", geometry]
+
     candidates: list[tuple[str, list[str]]] = [
-        ("feh",         ["feh", "--scale-down", "--geometry", "800x600"]),
+        ("feh",         ["feh", "--scale-down", "--geometry", geometry]),
         ("imv",         ["imv", "-s", "shrink"]),
         ("imv-wayland", ["imv-wayland", "-s", "shrink"]),
-        ("nsxiv",       ["nsxiv", "-g", "800x600"]),
-        ("sxiv",        ["sxiv", "-g", "800x600"]),
-        ("display",     ["display", "-auto-orient", "-resize", thumb]),
+        ("nsxiv",       ["nsxiv", "-g", geometry]),
+        ("sxiv",        ["sxiv", "-g", geometry]),
+        ("display",     display_args),
     ]
     for cmd, argv in candidates:
         if shutil.which(cmd):
@@ -177,6 +184,10 @@ def _read_key() -> str:
         seq = sys.stdin.read(1)
         if seq == "[":
             code = sys.stdin.read(1)
+            if code == "A":
+                return "up"
+            if code == "B":
+                return "down"
             if code == "C":
                 return "right"
             if code == "D":

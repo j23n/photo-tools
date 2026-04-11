@@ -1,10 +1,10 @@
 """
 build_landmarks.py — Build a CLIP embedding database of notable landmarks.
 
-Queries Wikidata for top landmarks (by sitelinks count), downloads multiple
-images per landmark from Wikidata properties and Wikimedia Commons categories,
-computes CLIP embeddings, averages them, and outputs landmarks.json for use
-by LandmarkIndex.
+Queries Wikidata for top landmarks (by sitelinks count), downloads
+images per landmark from Wikidata image properties, computes CLIP
+embeddings, averages them, and outputs landmarks.json for use by
+LandmarkIndex.
 """
 
 import io
@@ -80,12 +80,17 @@ LANDMARK_TYPES = [
 ]
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
-COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 
-# Wikidata image properties to collect per landmark
-WIKIDATA_IMAGE_PROPS = ["P18", "P3451", "P5775"]
+# Wikidata image properties to collect per landmark (all curator-assigned)
+WIKIDATA_IMAGE_PROPS = [
+    "P18",    # image
+    "P3451",  # nighttime view (old)
+    "P8517",  # view
+    "P5252",  # winter view
+    "P7417",  # nighttime view
+]
 
-# File extensions to skip from Commons category results
+# File extensions to skip from image results
 SKIP_EXTENSIONS = {".svg", ".ogg", ".ogv", ".webm", ".djvu", ".pdf", ".mid",
                    ".flac", ".wav", ".tiff", ".tif"}
 
@@ -159,12 +164,9 @@ def _filename_to_url(filename: str) -> str:
 def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[dict]:
     """Collect up to *target* image URLs for a landmark.
 
-    Each entry is ``{"url", "source", "width", "height"}``.
+    Each entry is ``{"url", "source"}``.
 
-    Sources (in order):
-      1. Wikidata image properties: P18, P3451, P5775
-      2. Commons Structured Data (P180 depicts) — clean, tagged images
-      3. Wikimedia Commons category (via P373) — noisy fallback
+    Source: Wikidata image properties (curator-assigned).
     """
     if target is None:
         target = get_config().wikidata.target_images
@@ -172,186 +174,35 @@ def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[dict]:
     seen_filenames: set[str] = set()
     urls: list[dict] = []
 
-    def _add(filename: str, source: str, width: int = 0, height: int = 0) -> bool:
-        key = filename.replace(" ", "_").lower()
-        if key in seen_filenames:
-            return False
-        seen_filenames.add(key)
-        urls.append({
-            "url": _filename_to_url(filename),
-            "source": source,
-            "width": width,
-            "height": height,
-        })
-        return True
-
-    # Source 1: Wikidata entity — image properties
     data = _api_get(WIKIDATA_API, {
         "action": "wbgetentities", "ids": wikidata_id,
         "props": "claims", "format": "json",
     })
-    claims = {}
-    if data:
-        claims = data.get("entities", {}).get(wikidata_id, {}).get("claims", {})
-        for prop in WIKIDATA_IMAGE_PROPS:
-            for claim in claims.get(prop, []):
-                try:
-                    filename = claim["mainsnak"]["datavalue"]["value"]
-                    _add(filename, f"wikidata:{prop}")
-                except (KeyError, TypeError):
-                    pass
+    if not data:
+        return urls
 
-    if len(urls) >= target:
-        return urls[:target]
-
-    # Source 2: Commons Structured Data (P180 depicts)
-    _collect_commons_depicts(
-        wikidata_id,
-        lambda fn, w, h: _add(fn, "commons_depicts", w, h),
-        target - len(urls),
-    )
-
-    if len(urls) >= target:
-        return urls[:target]
-
-    # Source 3: Wikimedia Commons category (P373, noisy fallback)
-    category = None
-    for claim in claims.get("P373", []):
-        try:
-            category = claim["mainsnak"]["datavalue"]["value"]
-            break
-        except (KeyError, TypeError):
-            pass
-
-    if category:
-        _collect_commons_category(
-            category,
-            lambda fn, cat, w, h: _add(fn, f"commons_category:{cat}", w, h),
-            target - len(urls),
-        )
+    claims = data.get("entities", {}).get(wikidata_id, {}).get("claims", {})
+    for prop in WIKIDATA_IMAGE_PROPS:
+        for claim in claims.get(prop, []):
+            try:
+                filename = claim["mainsnak"]["datavalue"]["value"]
+                key = filename.replace(" ", "_").lower()
+                if key in seen_filenames:
+                    continue
+                ext = Path(filename).suffix.lower()
+                if ext in SKIP_EXTENSIONS:
+                    continue
+                seen_filenames.add(key)
+                urls.append({
+                    "url": _filename_to_url(filename),
+                    "source": f"wikidata:{prop}",
+                })
+            except (KeyError, TypeError):
+                pass
+            if len(urls) >= target:
+                return urls[:target]
 
     return urls[:target]
-
-
-def _filter_commons_pages(pages: dict) -> list[tuple[int, str, int, int]]:
-    """Filter Commons API pages to usable image candidates, sorted by size desc.
-
-    Returns list of ``(pixels, filename, width, height)`` tuples.
-    """
-    candidates = []
-    for page in pages.values():
-        title = page.get("title", "")
-        filename = title.removeprefix("File:")
-        ext = Path(filename).suffix.lower()
-        if ext in SKIP_EXTENSIONS:
-            continue
-        ii = (page.get("imageinfo") or [{}])[0]
-        mime = ii.get("mime", "")
-        if not mime.startswith("image/"):
-            continue
-        w = ii.get("width", 0)
-        h = ii.get("height", 0)
-        if min(w, h) < 300:
-            continue
-        candidates.append((w * h, filename, w, h))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates
-
-
-def _collect_commons_category(
-    category: str,
-    add_fn,
-    remaining: int,
-    depth: int = 0,
-) -> int:
-    """Collect image files from a Commons category, recursing into subcats.
-
-    *add_fn* signature: ``(filename: str, category: str) -> bool``.
-    """
-    if remaining <= 0 or depth > 1:
-        return 0
-
-    blocklist = get_config().wikidata.commons_subcat_blocklist
-    added = 0
-
-    # Fetch direct file members
-    cm_data = _api_get(COMMONS_API, {
-        "action": "query",
-        "generator": "categorymembers",
-        "gcmtitle": f"Category:{category}",
-        "gcmtype": "file",
-        "gcmlimit": "30",
-        "prop": "imageinfo",
-        "iiprop": "size|mime",
-        "format": "json",
-    })
-    if cm_data:
-        candidates = _filter_commons_pages(
-            cm_data.get("query", {}).get("pages", {}),
-        )
-        for _, filename, w, h in candidates:
-            if added >= remaining:
-                return added
-            if add_fn(filename, category, w, h):
-                added += 1
-
-    if added >= remaining:
-        return added
-
-    # Recurse into subcategories (one level only)
-    sub_data = _api_get(COMMONS_API, {
-        "action": "query",
-        "list": "categorymembers",
-        "cmtitle": f"Category:{category}",
-        "cmtype": "subcat",
-        "cmlimit": "10",
-        "format": "json",
-    })
-    if sub_data:
-        for subcat in sub_data.get("query", {}).get("categorymembers", []):
-            sub_title = subcat.get("title", "").removeprefix("Category:")
-            lower = sub_title.lower()
-            if any(s in lower for s in blocklist):
-                continue
-            added += _collect_commons_category(
-                sub_title, add_fn, remaining - added, depth + 1,
-            )
-            if added >= remaining:
-                break
-
-    return added
-
-
-def _collect_commons_depicts(
-    wikidata_id: str,
-    add_fn,
-    remaining: int,
-) -> int:
-    """Collect images from Commons Structured Data that depict the entity."""
-    if remaining <= 0:
-        return 0
-
-    data = _api_get(COMMONS_API, {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": f"haswbstatement:P180={wikidata_id}",
-        "gsrnamespace": "6",
-        "gsrlimit": "30",
-        "prop": "imageinfo",
-        "iiprop": "size|mime",
-        "format": "json",
-    })
-    if not data:
-        return 0
-
-    candidates = _filter_commons_pages(data.get("query", {}).get("pages", {}))
-    added = 0
-    for _, filename, w, h in candidates:
-        if added >= remaining:
-            break
-        if add_fn(filename, w, h):
-            added += 1
-    return added
 
 
 def query_wikidata(limit: int) -> list[dict]:
@@ -558,15 +409,20 @@ def build_database(
             existing[lm["wikidata_id"]] = lm
         log.info("Resuming: %d landmarks already computed", len(existing))
 
-    if test:
-        landmarks = query_wikidata_geo(TEST_REGIONS, cfg.wikidata.test_limit)
-    elif wikidata_cache and wikidata_cache.exists():
+    dump_path = output_path.with_suffix(".wikidata.json")
+    if wikidata_cache and wikidata_cache.exists():
         with open(wikidata_cache) as f:
             landmarks = json.load(f)[:limit]
         log.info("Loaded %d landmarks from %s", len(landmarks), wikidata_cache)
+    elif dump_path.exists():
+        with open(dump_path) as f:
+            landmarks = json.load(f)[:limit]
+        log.info("Loaded %d landmarks from cache %s", len(landmarks), dump_path)
     else:
-        landmarks = query_wikidata(limit)
-        dump_path = output_path.with_suffix(".wikidata.json")
+        if test:
+            landmarks = query_wikidata_geo(TEST_REGIONS, cfg.wikidata.test_limit)
+        else:
+            landmarks = query_wikidata(limit)
         dump_path.parent.mkdir(parents=True, exist_ok=True)
         with open(dump_path, "w") as f:
             json.dump(landmarks, f, indent=2)

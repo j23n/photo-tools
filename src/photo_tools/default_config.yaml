@@ -48,23 +48,3 @@ wikidata:
   target_images: 10
   test_limit: 100
   test_per_type_limit: 20
-  commons_subcat_blocklist:
-    - plan
-    - map
-    - art
-    - replica
-    - model
-    - historical
-    - drawing
-    - engraving
-    - event
-    - stamp
-    - logo
-    - coin
-    - medal
-    - poster
-    - painting
-    - fresco
-    - reconstruction
-    - diagram
-    - schematic
