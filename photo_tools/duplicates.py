@@ -399,6 +399,9 @@ def build_tags_parser(subparsers) -> None:
     p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_rename_tag)
 
+    from photo_tools.debug_viewer import add_inspect_subparser
+    add_inspect_subparser(tags_sub)
+
 
 def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub = subparsers.add_parser(
