@@ -23,6 +23,10 @@ def build_landmarks_parser(subparsers) -> argparse.ArgumentParser:
                      help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
     sub.add_argument("--resume", action="store_true",
                      help="Skip landmarks already in output file")
+    sub.add_argument("--test", action="store_true",
+                     help="Build a small database (~200 landmarks in Rome and Bologna)")
+    sub.add_argument("--images-per-landmark", type=int, default=10,
+                     help="Target number of images per landmark (default: 10)")
     sub.add_argument("-v", "--verbose", action="store_true")
     sub.set_defaults(func=run_build_landmarks)
     return sub
@@ -40,6 +44,8 @@ def run_build_landmarks(args) -> None:
         clip_model=args.clip_model,
         clip_pretrained=args.clip_pretrained,
         resume=args.resume,
+        test=args.test,
+        images_per_landmark=args.images_per_landmark,
     )
 
 

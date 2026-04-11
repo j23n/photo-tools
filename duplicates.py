@@ -32,7 +32,7 @@ log = logging.getLogger("duplicates")
 
 
 # ---------------------------------------------------------------------------
-# Embedding loading (reads XMP cache, falls back to CLIPTagger)
+# Embedding loading (reads XMP cache, falls back to CLIPEmbedder)
 # ---------------------------------------------------------------------------
 
 def load_embeddings(
@@ -44,7 +44,7 @@ def load_embeddings(
     dry_run: bool,
 ) -> "dict[Path, np.ndarray]":
     """Load CLIP embeddings for all paths. Reads from XMP cache first,
-    falls back to computing via CLIPTagger for images without cached embeddings."""
+    falls back to computing via CLIPEmbedder for images without cached embeddings."""
     result = {}
     missing = []
     total = len(paths)
@@ -63,10 +63,10 @@ def load_embeddings(
     if not missing:
         return result
 
-    # Phase 2: compute missing embeddings via CLIPTagger
+    # Phase 2: compute missing embeddings via CLIPEmbedder
     log.info("%d/%d images need embedding, loading CLIP model ...", len(missing), total)
-    from clip_tagger import CLIPTagger, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
-    tagger = CLIPTagger(
+    from clip_tagger import CLIPEmbedder, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+    embedder = CLIPEmbedder(
         model_name=clip_model or DEFAULT_CLIP_MODEL,
         pretrained=clip_pretrained or DEFAULT_CLIP_PRETRAINED,
     )
@@ -76,7 +76,7 @@ def load_embeddings(
         prepared = prepare_image(path, CLIP_MAX_PIXELS)
         clip_input = prepared or path
         try:
-            _, embedding = tagger.tag_image(clip_input)
+            embedding = embedder.embed_image(clip_input)
             write_embedding(path, embedding, model_id, dry_run)
             result[path] = embedding
         except Exception as e:

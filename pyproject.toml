@@ -11,10 +11,17 @@ dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "open-clip-torch>=2.24.0",
+    "ram",
+    "transformers<=4.55.4",
+    "huggingface-hub>=0.20.0",
     "faiss-cpu>=1.7.0",
     "paddleocr>=3.4.0",
     "paddlepaddle>=3.3.0",
     "ruff>=0.15.9",
+    "scipy",
+    "timm==0.4.12",
+    "fairscale==0.4.4",
+    "Pillow",
 ]
 
 [project.scripts]
@@ -28,3 +35,4 @@ explicit = true
 [tool.uv.sources]
 torch = {index = "pytorch-cpu"}
 torchvision = {index = "pytorch-cpu"}
+ram = {git = "https://github.com/xinyu1205/recognize-anything.git"}

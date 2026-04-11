@@ -2,15 +2,18 @@
 """
 build_landmarks.py — Build a CLIP embedding database of notable landmarks.
 
-Queries Wikidata for top landmarks (by sitelinks count), downloads one
-Wikimedia Commons image per landmark, computes CLIP embeddings, and
-outputs landmarks.json for use by LandmarkIndex.
+Queries Wikidata for top landmarks (by sitelinks count), downloads multiple
+images per landmark from Wikidata properties and Wikimedia Commons categories,
+computes CLIP embeddings, averages them, and outputs landmarks.json for use
+by LandmarkIndex.
 
 Usage:
     uv run build_landmarks.py                        # Build with defaults
     uv run build_landmarks.py --limit 5000           # Fewer landmarks
     uv run build_landmarks.py --output landmarks.json
     uv run build_landmarks.py --resume               # Skip already-computed
+    uv run build_landmarks.py --test                 # Small DB with Rome+Bologna landmarks
+    uv run build_landmarks.py --images-per-landmark 5
 """
 
 import argparse
@@ -52,6 +55,22 @@ ORDER BY DESC(?sitelinks)
 LIMIT {limit}
 """
 
+# Geo-filtered variant: same structure but with a bounding-box constraint.
+SPARQL_TYPE_GEO_QUERY = """\
+SELECT ?item ?itemLabel ?lat ?lon ?image ?sitelinks WHERE {{
+  ?item wdt:P31 wd:{qid} .
+  ?item wdt:P625 ?coords .
+  ?item wdt:P18 ?image .
+  ?item wikibase:sitelinks ?sitelinks .
+  BIND(geof:latitude(?coords) AS ?lat)
+  BIND(geof:longitude(?coords) AS ?lon)
+  FILTER(?lat >= {lat_min} && ?lat <= {lat_max} && ?lon >= {lon_min} && ?lon <= {lon_max})
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+}}
+ORDER BY DESC(?sitelinks)
+LIMIT {limit}
+"""
+
 LANDMARK_TYPES = [
     # (qid, label, per-type limit)
     ("Q570116", "tourist attraction", 2000),
@@ -78,6 +97,27 @@ LANDMARK_TYPES = [
 MAX_RETRIES = 3
 RETRY_BACKOFF = 30  # seconds
 
+TARGET_IMAGES = 10  # images per landmark for multi-image averaging
+
+WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+
+# Wikidata image properties to collect per landmark
+WIKIDATA_IMAGE_PROPS = ["P18", "P3451", "P5775", "P4291"]
+
+# File extensions to skip from Commons category results
+SKIP_EXTENSIONS = {".svg", ".ogg", ".ogv", ".webm", ".djvu", ".pdf", ".mid",
+                   ".flac", ".wav", ".tiff", ".tif"}
+
+# Geographic regions for --test mode: bounding boxes queried via Wikidata.
+# (name, lat_min, lat_max, lon_min, lon_max)
+TEST_REGIONS = [
+    ("Rome",    41.75, 42.05, 12.30, 12.70),
+    ("Bologna", 44.35, 44.65, 11.15, 11.55),
+]
+
+TEST_LIMIT = 200
+
 
 def _sparql_get(query: str) -> list[dict]:
     """Execute a SPARQL query with retry on timeout/5xx."""
@@ -99,6 +139,167 @@ def _sparql_get(query: str) -> list[dict]:
             log.warning("Query failed (%s), retrying in %ds (%d/%d)", e, wait, attempt, MAX_RETRIES)
             time.sleep(wait)
     return []  # unreachable, keeps type checkers happy
+
+
+def _api_get(url: str, params: dict, timeout: int = 30) -> dict | None:
+    """GET a JSON API endpoint, retrying on 429 with Retry-After."""
+    for _ in range(2):
+        try:
+            resp = requests.get(
+                url, params=params,
+                headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
+                timeout=timeout,
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 2))
+                log.warning("API rate limited — sleeping %ds", retry_after)
+                time.sleep(retry_after)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.debug("API request failed (%s): %s", url, e)
+            return None
+    log.warning("Still rate-limited after retry for %s, skipping", url)
+    return None
+
+
+def _filename_to_url(filename: str) -> str:
+    """Convert a Wikimedia Commons filename to a Special:FilePath URL."""
+    encoded = urllib.parse.quote(filename.replace(" ", "_"))
+    return f"https://commons.wikimedia.org/wiki/Special:FilePath/{encoded}"
+
+
+def fetch_image_urls(wikidata_id: str, target: int = TARGET_IMAGES) -> list[str]:
+    """Collect up to *target* image URLs for a landmark from Wikidata + Commons.
+
+    Sources (in order):
+      1. Wikidata image properties: P18, P3451, P5775, P4291
+      2. Wikimedia Commons category (via P373) — topped up to reach *target*
+    """
+    seen_filenames: set[str] = set()
+    urls: list[str] = []
+
+    def _add(filename: str) -> bool:
+        key = filename.replace(" ", "_").lower()
+        if key in seen_filenames:
+            return False
+        seen_filenames.add(key)
+        urls.append(_filename_to_url(filename))
+        return True
+
+    # ── Source 1: Wikidata entity — image properties + Commons category ──
+    data = _api_get(WIKIDATA_API, {
+        "action": "wbgetentities", "ids": wikidata_id,
+        "props": "claims", "format": "json",
+    })
+    claims = {}
+    if data:
+        claims = data.get("entities", {}).get(wikidata_id, {}).get("claims", {})
+        for prop in WIKIDATA_IMAGE_PROPS:
+            for claim in claims.get(prop, []):
+                try:
+                    filename = claim["mainsnak"]["datavalue"]["value"]
+                    _add(filename)
+                except (KeyError, TypeError):
+                    pass
+
+    if len(urls) >= target:
+        return urls[:target]
+
+    # ── Source 2: Wikimedia Commons category (P373 already fetched above) ──
+    category = None
+    for claim in claims.get("P373", []):
+        try:
+            category = claim["mainsnak"]["datavalue"]["value"]
+            break
+        except (KeyError, TypeError):
+            pass
+
+    if category:
+        _collect_commons_category(category, _add, target - len(urls))
+
+    return urls[:target]
+
+
+def _collect_commons_category(
+    category: str,
+    add_fn,
+    remaining: int,
+    depth: int = 0,
+) -> int:
+    """Collect image files from a Commons category, recursing into subcats.
+
+    Returns number of images added.
+    """
+    if remaining <= 0 or depth > 1:
+        return 0
+
+    added = 0
+
+    # Fetch direct file members
+    cm_data = _api_get(COMMONS_API, {
+        "action": "query",
+        "generator": "categorymembers",
+        "gcmtitle": f"Category:{category}",
+        "gcmtype": "file",
+        "gcmlimit": "30",
+        "prop": "imageinfo",
+        "iiprop": "size|mime",
+        "format": "json",
+    })
+    if cm_data:
+        pages = cm_data.get("query", {}).get("pages", {})
+        candidates = []
+        for page in pages.values():
+            title = page.get("title", "")
+            filename = title.removeprefix("File:")
+            ext = Path(filename).suffix.lower()
+            if ext in SKIP_EXTENSIONS:
+                continue
+            ii = (page.get("imageinfo") or [{}])[0]
+            mime = ii.get("mime", "")
+            if not mime.startswith("image/"):
+                continue
+            w = ii.get("width", 0)
+            h = ii.get("height", 0)
+            if min(w, h) < 300:
+                continue
+            candidates.append((w * h, filename))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, filename in candidates:
+            if added >= remaining:
+                return added
+            if add_fn(filename):
+                added += 1
+
+    if added >= remaining:
+        return added
+
+    # Recurse into subcategories (one level only)
+    sub_data = _api_get(COMMONS_API, {
+        "action": "query",
+        "list": "categorymembers",
+        "cmtitle": f"Category:{category}",
+        "cmtype": "subcat",
+        "cmlimit": "10",
+        "format": "json",
+    })
+    if sub_data:
+        for subcat in sub_data.get("query", {}).get("categorymembers", []):
+            sub_title = subcat.get("title", "").removeprefix("Category:")
+            # Skip non-photo subcategories
+            lower = sub_title.lower()
+            if any(s in lower for s in ("plan", "map", "art", "replica", "model")):
+                continue
+            added += _collect_commons_category(
+                sub_title, add_fn, remaining - added, depth + 1,
+            )
+            if added >= remaining:
+                break
+
+    return added
 
 
 def query_wikidata(limit: int) -> list[dict]:
@@ -133,6 +334,52 @@ def query_wikidata(limit: int) -> list[dict]:
         del lm["_sitelinks"]
 
     log.info("Deduplicated to %d unique landmarks (top %d kept)", len(landmarks), limit)
+    return landmarks
+
+
+def query_wikidata_geo(
+    regions: list[tuple[str, float, float, float, float]],
+    limit: int,
+) -> list[dict]:
+    """Query Wikidata for notable landmarks within geographic bounding boxes."""
+    log.info("Querying Wikidata for top %d landmarks in %d regions ...",
+             limit, len(regions))
+
+    seen_ids: dict[str, dict] = {}
+    for region_name, lat_min, lat_max, lon_min, lon_max in regions:
+        log.info("Region: %s (lat %.2f–%.2f, lon %.2f–%.2f)",
+                 region_name, lat_min, lat_max, lon_min, lon_max)
+        for qid, label, type_limit in LANDMARK_TYPES:
+            geo_limit = min(type_limit, 200)
+            query = SPARQL_TYPE_GEO_QUERY.format(
+                qid=qid, limit=geo_limit,
+                lat_min=lat_min, lat_max=lat_max,
+                lon_min=lon_min, lon_max=lon_max,
+            )
+            results = _sparql_get(query)
+            if results:
+                log.info("  %s / %s: %d results", region_name, label, len(results))
+            for r in results:
+                wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
+                if wikidata_id in seen_ids:
+                    continue
+                seen_ids[wikidata_id] = {
+                    "name": r["itemLabel"]["value"],
+                    "wikidata_id": wikidata_id,
+                    "lat": float(r["lat"]["value"]),
+                    "lon": float(r["lon"]["value"]),
+                    "image_url": r["image"]["value"],
+                    "_sitelinks": int(r["sitelinks"]["value"]),
+                }
+            time.sleep(1)
+
+    landmarks = sorted(seen_ids.values(), key=lambda x: x["_sitelinks"],
+                       reverse=True)[:limit]
+    for lm in landmarks:
+        del lm["_sitelinks"]
+
+    log.info("Found %d unique landmarks across regions (top %d kept)",
+             len(seen_ids), len(landmarks))
     return landmarks
 
 
@@ -183,13 +430,15 @@ def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename
     return True
 
 
-def download_image(url: str, wikidata_id: str, max_width: int = 512) -> tuple[Path | None, bool]:
+def download_image(url: str, wikidata_id: str, cache_key: str | None = None,
+                   max_width: int = 512) -> tuple[Path | None, bool]:
     """Download a Wikimedia Commons image, resized via thumbnail API.
 
     For formats the thumbnail API cannot handle (TIFF, DjVu, …), the
     full original is downloaded and resized locally with Pillow.
 
-    Images are cached in ~/.cache/photo-tools/landmark-images/ by Wikidata ID.
+    Images are cached in ~/.cache/photo-tools/landmark-images/.
+    *cache_key* overrides the default wikidata_id-based cache filename.
     """
     filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
     ext = Path(filename).suffix.lower()
@@ -197,7 +446,8 @@ def download_image(url: str, wikidata_id: str, max_width: int = 512) -> tuple[Pa
 
     # Cache as .jpg when we resize locally (original format not useful downstream)
     cache_suffix = ".jpg" if needs_local_resize else (ext or ".jpg")
-    cached = IMAGE_CACHE_DIR / f"{wikidata_id}{cache_suffix}"
+    key = cache_key or wikidata_id
+    cached = IMAGE_CACHE_DIR / f"{key}{cache_suffix}"
     if cached.exists() and cached.stat().st_size >= 1000:
         return cached, True
 
@@ -240,8 +490,10 @@ def build_database(
     clip_pretrained: str,
     resume: bool,
     wikidata_cache: Path | None = None,
+    test: bool = False,
+    images_per_landmark: int = TARGET_IMAGES,
 ) -> None:
-    from clip_tagger import CLIPTagger
+    from clip_tagger import CLIPEmbedder
 
     # Load existing data if resuming
     existing: dict[str, dict] = {}
@@ -252,7 +504,9 @@ def build_database(
             existing[lm["wikidata_id"]] = lm
         log.info("Resuming: %d landmarks already computed", len(existing))
 
-    if wikidata_cache and wikidata_cache.exists():
+    if test:
+        landmarks = query_wikidata_geo(TEST_REGIONS, TEST_LIMIT)
+    elif wikidata_cache and wikidata_cache.exists():
         with open(wikidata_cache) as f:
             landmarks = json.load(f)[:limit]
         log.info("Loaded %d landmarks from %s", len(landmarks), wikidata_cache)
@@ -265,94 +519,148 @@ def build_database(
             json.dump(landmarks, f, indent=2)
         log.info("Dumped %d Wikidata entries to %s", len(landmarks), dump_path)
 
-    # Phase 1: download all images (2 workers)
-    candidates = [lm for lm in landmarks if lm["wikidata_id"] not in existing or not existing[lm["wikidata_id"]].get("embedding")]
+    candidates = [lm for lm in landmarks
+                  if lm["wikidata_id"] not in existing
+                  or not existing[lm["wikidata_id"]].get("embedding")]
+
+    # ── Phase 0: collect image URLs ──
+    urls_cache_path = output_path.with_suffix(".urls.json")
+    landmark_urls: dict[str, list[str]] = {}
+    if urls_cache_path.exists():
+        with open(urls_cache_path) as f:
+            landmark_urls = json.load(f)
+        log.info("Loaded cached URLs for %d landmarks from %s",
+                 len(landmark_urls), urls_cache_path)
+
+    urls_to_fetch = [lm for lm in candidates
+                     if lm["wikidata_id"] not in landmark_urls]
+    if urls_to_fetch:
+        log.info("Collecting image URLs for %d landmarks ...", len(urls_to_fetch))
+        for i, lm in enumerate(urls_to_fetch, 1):
+            wid = lm["wikidata_id"]
+            print(f"\r  urls [{i}/{len(urls_to_fetch)}] {lm['name']:<50}",
+                  end="", flush=True, file=sys.stderr)
+            urls = fetch_image_urls(wid, target=images_per_landmark)
+            landmark_urls[wid] = urls
+            log.debug("  %s: %d URLs", lm["name"], len(urls))
+            # Persist after each landmark so progress survives interrupts
+            urls_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(urls_cache_path, "w") as f:
+                json.dump(landmark_urls, f)
+            time.sleep(0.5)  # be kind to the APIs
+        print(file=sys.stderr)
+        log.info("Collected URLs for %d landmarks (total %d in cache)",
+                 len(urls_to_fetch), len(landmark_urls))
+
+    # ── Download + embed in batches ──
+    # Process landmarks in batches: download images, compute embeddings,
+    # and save after each batch so progress survives interrupts.
+    BATCH_SIZE = 10
+    embedder = None  # lazy-init on first batch that needs embedding
+
+    results = list(existing.values())
     download_failed = 0
-    cached_count = 0
     downloaded_count = 0
-    image_paths: dict[str, Path] = {}
+    cached_count = 0
+    embed_failed = 0
+    total_landmarks = len(landmarks)
 
-    # Pre-scan disk cache so only truly missing images go to the thread pool
-    need_download: list[dict] = []
-    for lm in candidates:
-        wid = lm["wikidata_id"]
-        ext = Path(urllib.parse.unquote(lm["image_url"].rsplit("/", 1)[-1])).suffix.lower() or ".jpg"
-        suffix = ".jpg" if ext in _NO_THUMB_EXTS else ext
-        cached = IMAGE_CACHE_DIR / f"{wid}{suffix}"
-        if cached.exists() and cached.stat().st_size >= 1000:
-            image_paths[wid] = cached
-            cached_count += 1
-        else:
-            need_download.append(lm)
-    if cached_count:
-        log.info("Images: %d already cached on disk, %d to download", cached_count, len(need_download))
+    for batch_start in range(0, len(candidates), BATCH_SIZE):
+        batch = candidates[batch_start:batch_start + BATCH_SIZE]
+        batch_num = batch_start // BATCH_SIZE + 1
+        total_batches = (len(candidates) + BATCH_SIZE - 1) // BATCH_SIZE
+        log.info("Batch %d/%d (%d landmarks) ...", batch_num, total_batches, len(batch))
 
-    total = len(need_download)
-    done_count = 0
-
-    def _download(lm: dict) -> tuple[str, str, Path | None, bool]:
-        wid = lm["wikidata_id"]
-        img_path, was_cached = download_image(lm["image_url"], wid)
-        return wid, lm["name"], img_path, was_cached
-
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-        futures = [pool.submit(_download, lm) for lm in need_download]
-        for future in as_completed(futures):
-            wid, name, img_path, was_cached = future.result()
-            done_count += 1
-            if img_path is not None:
-                image_paths[wid] = img_path
-                if was_cached:
-                    # Race: another run cached it between our scan and download
+        # ── Download images for this batch ──
+        batch_downloads: list[tuple[str, int, str]] = []
+        image_paths: dict[str, list[Path]] = {}
+        for lm in batch:
+            wid = lm["wikidata_id"]
+            for idx, url in enumerate(landmark_urls.get(wid, [])):
+                cache_key = f"{wid}_{idx}"
+                filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+                ext = Path(filename).suffix.lower() or ".jpg"
+                suffix = ".jpg" if ext in _NO_THUMB_EXTS else ext
+                cached = IMAGE_CACHE_DIR / f"{cache_key}{suffix}"
+                if cached.exists() and cached.stat().st_size >= 1000:
+                    image_paths.setdefault(wid, []).append(cached)
                     cached_count += 1
                 else:
-                    downloaded_count += 1
-            else:
-                download_failed += 1
-            print(f"\r  images [{done_count}/{total}] {downloaded_count} new, {download_failed} failed — {name:<40}", end="", flush=True, file=sys.stderr)
-    print(file=sys.stderr)
-    log.info("Images: %d downloaded, %d cached, %d failed", downloaded_count, cached_count, download_failed)
+                    batch_downloads.append((wid, idx, url))
 
-    # Phase 2: embed
-    tagger = CLIPTagger(model_name=clip_model, pretrained=clip_pretrained)
+        if batch_downloads:
+            done_count = 0
+            total = len(batch_downloads)
 
-    results = []
-    embed_failed = 0
-    embed_total = len(landmarks)
+            def _download(task: tuple[str, int, str]) -> tuple[str, int, Path | None, bool]:
+                wid, idx, url = task
+                cache_key = f"{wid}_{idx}"
+                img_path, was_cached = download_image(url, wid, cache_key=cache_key)
+                return wid, idx, img_path, was_cached
 
-    for i, lm in enumerate(landmarks, 1):
-        wid = lm["wikidata_id"]
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                futures = [pool.submit(_download, t) for t in batch_downloads]
+                for future in as_completed(futures):
+                    wid, idx, img_path, was_cached = future.result()
+                    done_count += 1
+                    if img_path is not None:
+                        image_paths.setdefault(wid, []).append(img_path)
+                        if was_cached:
+                            cached_count += 1
+                        else:
+                            downloaded_count += 1
+                    else:
+                        download_failed += 1
+                    if done_count % 10 == 0 or done_count == total:
+                        print(f"\r  images [{done_count}/{total}] "
+                              f"{downloaded_count} new, {download_failed} failed",
+                              end="", flush=True, file=sys.stderr)
+            print(file=sys.stderr)
 
-        if wid in existing and existing[wid].get("embedding"):
-            results.append(existing[wid])
-            print(f"\r  embedding [{i}/{embed_total}] {lm['name']} (cached)", end="", flush=True, file=sys.stderr)
-            continue
+        # ── Embed this batch ──
+        for lm in batch:
+            wid = lm["wikidata_id"]
+            paths = image_paths.get(wid, [])
+            if not paths:
+                continue
 
-        img_path = image_paths.get(wid)
-        if img_path is None:
-            continue
+            global_idx = batch_start + batch.index(lm) + 1
+            print(f"\r  embedding [{global_idx}/{total_landmarks}] "
+                  f"{lm['name']:<40} ({len(paths)} images)",
+                  end="", flush=True, file=sys.stderr)
 
-        print(f"\r  embedding [{i}/{embed_total}] {lm['name']:<50}", end="", flush=True, file=sys.stderr)
+            if embedder is None:
+                print(file=sys.stderr)
+                embedder = CLIPEmbedder(model_name=clip_model, pretrained=clip_pretrained)
 
-        try:
-            _, embedding = tagger.tag_image(img_path)
+            embeddings = []
+            for img_path in paths:
+                try:
+                    emb = embedder.embed_image(img_path)
+                    embeddings.append(emb)
+                except Exception as e:
+                    log.debug("Failed to embed %s image %s: %s",
+                              lm["name"], img_path.name, e)
+
+            if not embeddings:
+                embed_failed += 1
+                continue
+
+            avg = np.mean(embeddings, axis=0)
+            avg = avg / np.linalg.norm(avg)
+
             results.append({
                 "name": lm["name"],
                 "wikidata_id": wid,
                 "lat": lm["lat"],
                 "lon": lm["lon"],
-                "embedding": embedding.tolist(),
+                "embedding": avg.tolist(),
             })
-        except Exception as e:
-            log.debug("Failed to embed %s: %s", lm["name"], e)
-            embed_failed += 1
 
-        # Periodic save every 500 landmarks
-        if i % 500 == 0:
-            _save(output_path, clip_model, clip_pretrained, results)
+        # Save after each batch
+        print(file=sys.stderr)
+        _save(output_path, clip_model, clip_pretrained, results)
 
-    print(file=sys.stderr)
-    _save(output_path, clip_model, clip_pretrained, results)
     log.info("Done. %d landmarks saved, %d download failed, %d embed failed",
              len(results), download_failed, embed_failed)
 
@@ -379,6 +687,10 @@ def main():
                         help="Skip landmarks already in output file")
     parser.add_argument("--wikidata-cache", type=Path, metavar="PATH",
                         help="Load landmarks from a previous .wikidata.json instead of querying")
+    parser.add_argument("--test", action="store_true",
+                        help="Build a small database (~200 landmarks in Rome and Bologna)")
+    parser.add_argument("--images-per-landmark", type=int, default=TARGET_IMAGES,
+                        help=f"Target number of images per landmark (default: {TARGET_IMAGES})")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -392,6 +704,8 @@ def main():
         clip_pretrained=args.clip_pretrained,
         resume=args.resume,
         wikidata_cache=args.wikidata_cache,
+        test=args.test,
+        images_per_landmark=args.images_per_landmark,
     )
 
 

@@ -34,6 +34,7 @@ import argparse
 import base64
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -85,6 +86,8 @@ BARE_TAGS = {"weekend", "weekday", "screenshot", "video", AI_TAG_MARKER}
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 NOMINATIM_USER_AGENT = "autotag-photo-tagger/1.0"
 _last_nominatim_call = 0.0
+_geocode_cache: list[tuple[float, float, dict]] = []  # (lat, lon, address)
+GEOCODE_CACHE_RADIUS_KM = 0.5
 
 SCREENSHOT_RESOLUTIONS = {
     (1170, 2532), (1284, 2778), (1179, 2556), (1290, 2796),
@@ -164,7 +167,7 @@ def read_exif(path: Path) -> dict:
     ]
     try:
         result = subprocess.run(
-            ["exiftool"] + fields + [str(path)],
+            ["exiftool"] + fields + [f"{str(path)}"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -492,6 +495,11 @@ def build_gps_timeline(paths: list[Path]) -> dict[Path, tuple[float, float]]:
 
 
 def reverse_geocode(lat: float, lon: float) -> dict:
+    from landmarks import _haversine_km
+    for clat, clon, addr in _geocode_cache:
+        if _haversine_km(lat, lon, clat, clon) < GEOCODE_CACHE_RADIUS_KM:
+            return addr
+
     global _last_nominatim_call
     elapsed = time.time() - _last_nominatim_call
     if elapsed < 1.1:
@@ -506,11 +514,13 @@ def reverse_geocode(lat: float, lon: float) -> dict:
         )
         _last_nominatim_call = time.time()
         resp.raise_for_status()
-        return resp.json().get("address", {})
+        addr = resp.json().get("address", {})
     except Exception as e:
         log.warning("Geocoding failed for (%.4f, %.4f): %s", lat, lon, e)
         _last_nominatim_call = time.time()
         return {}
+    _geocode_cache.append((lat, lon, addr))
+    return addr
 
 
 def tags_from_gps(exif: dict) -> list[str]:
@@ -1113,7 +1123,8 @@ def find_images(target: Path, recursive: bool = False) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 # Lazy-initialized singletons
-_clip_tagger = None
+_ram_tagger = None
+_clip_embedder = None
 _landmark_index = None
 _ocr_engine = None
 
@@ -1137,15 +1148,23 @@ def _get_ocr_engine():
     return _ocr_engine
 
 
-def _get_clip_tagger(clip_model: str = None, clip_pretrained: str = None):
-    global _clip_tagger
-    if _clip_tagger is None:
-        from clip_tagger import CLIPTagger, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
-        _clip_tagger = CLIPTagger(
+def _get_ram_tagger():
+    global _ram_tagger
+    if _ram_tagger is None:
+        from ram_tagger import RAMTagger
+        _ram_tagger = RAMTagger()
+    return _ram_tagger
+
+
+def _get_clip_embedder(clip_model: str = None, clip_pretrained: str = None):
+    global _clip_embedder
+    if _clip_embedder is None:
+        from clip_tagger import CLIPEmbedder, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+        _clip_embedder = CLIPEmbedder(
             model_name=clip_model or DEFAULT_CLIP_MODEL,
             pretrained=clip_pretrained or DEFAULT_CLIP_PRETRAINED,
         )
-    return _clip_tagger
+    return _clip_embedder
 
 
 def _get_landmark_index(landmarks_path: Path = None):
@@ -1165,9 +1184,8 @@ def process_single(
     dry_run: bool,
     force: bool,
     clear_all: bool = False,
-    enable_clip: bool = True,
-    enable_geo: bool = True,
-    enable_exif: bool = True,
+    enable_ram: bool = True,
+    enable_landmarks: bool = True,
     enable_ocr: bool = True,
     clip_model: str = None,
     clip_pretrained: str = None,
@@ -1204,7 +1222,7 @@ def process_single(
     log.info("Processing %s ...", path.name)
     all_tags = []
 
-    # For videos, extract a frame for CLIP and OCR
+    # For videos, extract a frame for visual pipelines
     frame_path = None
     if video:
         all_tags.append("video")
@@ -1212,20 +1230,19 @@ def process_single(
         if frame_path is None:
             log.warning("Could not extract frame from %s, running EXIF/GPS only", path.name)
 
-    # The image to use for CLIP and OCR (original file or extracted frame)
+    # The image to use for RAM++, CLIP, and OCR (original file or extracted frame)
     visual_path = frame_path if video else path
 
-    if enable_exif:
-        t = tags_from_exif(exif)
-        if t:
-            log.debug("  EXIF: %s", t)
-            all_tags.extend(t)
+    # EXIF and GPS always run
+    t = tags_from_exif(exif)
+    if t:
+        log.debug("  EXIF: %s", t)
+        all_tags.extend(t)
 
-    if enable_geo:
-        t = tags_from_gps(exif)
-        if t:
-            log.debug("  Geo:  %s", t)
-            all_tags.extend(t)
+    t = tags_from_gps(exif)
+    if t:
+        log.debug("  Geo:  %s", t)
+        all_tags.extend(t)
 
     ocr_regions = []
     if enable_ocr and visual_path:
@@ -1234,28 +1251,39 @@ def process_single(
             log.debug("  OCR:  %s", t)
             all_tags.extend(t)
 
+    # RAM++ and CLIP embedding share the same prepared image
     embedding = None
-    if enable_clip and visual_path:
-        # Prepare image for CLIP (needs JPEG)
-        prepared = prepare_image(visual_path, CLIP_MAX_PIXELS)
-        clip_input = prepared or visual_path
-        try:
-            tagger = _get_clip_tagger(clip_model, clip_pretrained)
-            clip_tags, embedding = tagger.tag_image(clip_input)
-            log.debug("  CLIP: %s", clip_tags)
-            all_tags.extend(clip_tags)
-        except Exception as e:
-            log.warning("CLIP tagging failed for %s: %s", path.name, e)
-        finally:
-            if prepared:
-                try:
-                    os.unlink(prepared)
-                except OSError:
-                    pass
+    need_visual = (enable_ram or enable_landmarks) and visual_path
+    prepared = prepare_image(visual_path, CLIP_MAX_PIXELS) if need_visual else None
+    visual_input = prepared or visual_path
 
-        # Landmark lookup using the CLIP embedding (requires GPS)
-        coords = (get_gps_coords(exif) or gps_fallback) if embedding is not None else None
-        if embedding is not None and coords is not None:
+    if enable_ram and visual_path:
+        try:
+            tagger = _get_ram_tagger()
+            ram_tags = tagger.tag_image(visual_input)
+            log.debug("  RAM++: %s", ram_tags)
+            all_tags.extend(ram_tags)
+        except Exception as e:
+            log.warning("RAM++ tagging failed for %s: %s", path.name, e)
+
+    # CLIP embedding (needed for landmark lookup + duplicate detection cache)
+    if (enable_ram or enable_landmarks) and visual_path:
+        try:
+            embedder = _get_clip_embedder(clip_model, clip_pretrained)
+            embedding = embedder.embed_image(visual_input)
+        except Exception as e:
+            log.warning("CLIP embedding failed for %s: %s", path.name, e)
+
+    if prepared:
+        try:
+            os.unlink(prepared)
+        except OSError:
+            pass
+
+    # Landmark lookup using the CLIP embedding (requires GPS)
+    if enable_landmarks and embedding is not None:
+        coords = get_gps_coords(exif) or gps_fallback
+        if coords is not None:
             lat, lon = coords
             try:
                 lm_index = _get_landmark_index(landmarks_path)
@@ -1270,7 +1298,7 @@ def process_single(
 
     # Cache CLIP embedding in XMP for duplicate detection reuse
     if embedding is not None and not dry_run:
-        model_id = _get_clip_tagger(clip_model, clip_pretrained).model_id
+        model_id = _get_clip_embedder(clip_model, clip_pretrained).model_id
         write_embedding(path, embedding, model_id, dry_run)
 
     # Clean up temp frame
@@ -1303,7 +1331,7 @@ def process_single(
 # ---------------------------------------------------------------------------
 
 def watch_directory(target, recursive, dry_run,
-                    enable_clip, enable_geo, enable_exif, enable_ocr,
+                    enable_ram, enable_landmarks, enable_ocr,
                     clip_model=None, clip_pretrained=None, landmarks_path=None):
     log.info("Watching %s for new images (Ctrl+C to stop) ...", target)
     seen: set[Path] = set()
@@ -1325,8 +1353,9 @@ def watch_directory(target, recursive, dry_run,
                     seen.add(resolved)
                     continue
                 process_single(img, dry_run, force=False,
-                               enable_clip=enable_clip, enable_geo=enable_geo,
-                               enable_exif=enable_exif, enable_ocr=enable_ocr,
+                               enable_ram=enable_ram,
+                               enable_landmarks=enable_landmarks,
+                               enable_ocr=enable_ocr,
                                clip_model=clip_model, clip_pretrained=clip_pretrained,
                                landmarks_path=landmarks_path)
                 seen.add(resolved)
@@ -1352,19 +1381,29 @@ def _add_tag_args(parser: argparse.ArgumentParser) -> None:
                         help="Wipe ALL keywords before re-tagging (nuclear option)")
     parser.add_argument("-w", "--watch", action="store_true",
                         help="Watch directory for new images")
-    parser.add_argument("--clip-model", default=None,
-                        help="CLIP model name (default: ViT-B-32)")
-    parser.add_argument("--clip-pretrained", default=None,
-                        help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
-    parser.add_argument("--landmarks", type=Path, default=None,
+
+    # Pipeline selection (default: all)
+    pipelines = parser.add_argument_group(
+        "pipeline selection",
+        "Choose which tagging pipelines to run. "
+        "When none are specified, all pipelines run. "
+        "EXIF metadata and GPS geocoding always run."
+    )
+    pipelines.add_argument("--ram", action="store_true",
+                           help="Run RAM++ image content tagging")
+    pipelines.add_argument("--landmarks", action="store_true",
+                           help="Run landmark lookup (CLIP embedding + GPS)")
+    pipelines.add_argument("--ocr", action="store_true",
+                           help="Run OCR text detection")
+
+    # Model configuration
+    parser.add_argument("--clip-model", default="ViT-B-32",
+                     help="CLIP model name (default: ViT-B-32)")
+    parser.add_argument("--clip-pretrained", default="laion2b_s34b_b79k",
+                     help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
+    parser.add_argument("--landmarks-db", type=Path, default=None,
+                        dest="landmarks_db",
                         help="Path to landmarks.json (default: ~/.local/share/photo-tools/landmarks.json)")
-    parser.add_argument("--taxonomy", type=Path, default=None,
-                        help="Path to label taxonomy JSON (default: apple_labels.json next to source)")
-    parser.add_argument("--no-clip", action="store_true",
-                        help="Skip CLIP tagging (only geo + EXIF + OCR)")
-    parser.add_argument("--no-geo", action="store_true")
-    parser.add_argument("--no-exif", action="store_true")
-    parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -1372,7 +1411,7 @@ def build_tag_parser(subparsers) -> argparse.ArgumentParser:
     """Register the 'tag' subcommand on the given subparsers object."""
     sub = subparsers.add_parser(
         "tag",
-        help="Auto-tag photos using CLIP zero-shot classification, GPS geocoding, OCR, and EXIF metadata.",
+        help="Auto-tag photos using RAM++, landmark lookup, OCR, GPS geocoding, and EXIF metadata.",
     )
     _add_tag_args(sub)
     sub.set_defaults(func=run_tag)
@@ -1383,22 +1422,17 @@ def run_tag(args) -> None:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.taxonomy:
-        from taxonomy import set_labels_path
-        set_labels_path(args.taxonomy)
+    # Pipeline selection: if none specified, all are active
+    any_selected = args.ram or args.landmarks or args.ocr
+    enable_ram = args.ram or not any_selected
+    enable_landmarks = args.landmarks or not any_selected
+    enable_ocr = args.ocr or not any_selected
 
-    enable_clip = not args.no_clip
-    enable_geo = not args.no_geo
-    enable_exif = not args.no_exif
-    enable_ocr = not args.no_ocr
-
-    sources = []
-    if enable_exif: sources.append("EXIF")
-    if enable_geo:  sources.append("GPS")
-    if enable_ocr:  sources.append("OCR")
-    if enable_clip: sources.append(f"CLIP ({args.clip_model or 'ViT-B-32'})")
-    lm_path = args.landmarks or (Path.home() / ".local/share/photo-tools/landmarks.json")
-    if enable_clip and lm_path.exists():
+    sources = ["EXIF", "GPS"]
+    if enable_ram:       sources.append("RAM++")
+    if enable_ocr:       sources.append("OCR")
+    lm_path = args.landmarks_db or (Path.home() / ".local/share/photo-tools/landmarks.json")
+    if enable_landmarks and lm_path.exists():
         sources.append("Landmarks")
     log.info("Tag sources: %s", " + ".join(sources))
 
@@ -1407,10 +1441,10 @@ def run_tag(args) -> None:
             log.error("--watch requires a directory")
             sys.exit(1)
         watch_directory(args.path, args.recursive, args.dry_run,
-                        enable_clip, enable_geo, enable_exif, enable_ocr,
+                        enable_ram, enable_landmarks, enable_ocr,
                         clip_model=args.clip_model,
                         clip_pretrained=args.clip_pretrained,
-                        landmarks_path=args.landmarks)
+                        landmarks_path=args.landmarks_db)
         return
 
     images = find_images(args.path, args.recursive)
@@ -1421,7 +1455,7 @@ def run_tag(args) -> None:
     log.info("Found %d image(s) to process", len(images))
 
     # Pre-scan GPS timeline so images missing GPS can borrow from neighbours
-    gps_timeline = build_gps_timeline(images) if enable_clip else {}
+    gps_timeline = build_gps_timeline(images) if (enable_ram or enable_landmarks) else {}
 
     success = failed = skipped = 0
 
@@ -1430,11 +1464,12 @@ def run_tag(args) -> None:
         try:
             result = process_single(img, args.dry_run, args.force,
                                     clear_all=args.clear_all,
-                                    enable_clip=enable_clip, enable_geo=enable_geo,
-                                    enable_exif=enable_exif, enable_ocr=enable_ocr,
+                                    enable_ram=enable_ram,
+                                    enable_landmarks=enable_landmarks,
+                                    enable_ocr=enable_ocr,
                                     clip_model=args.clip_model,
                                     clip_pretrained=args.clip_pretrained,
-                                    landmarks_path=args.landmarks,
+                                    landmarks_path=args.landmarks_db,
                                     gps_fallback=gps_timeline.get(img))
             if result:
                 success += 1
@@ -1449,7 +1484,7 @@ def run_tag(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auto-tag photos using CLIP, GPS geocoding, OCR, and EXIF metadata.",
+        description="Auto-tag photos using RAM++, landmark lookup, OCR, GPS geocoding, and EXIF metadata.",
     )
     _add_tag_args(parser)
     args = parser.parse_args()
