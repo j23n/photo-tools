@@ -211,18 +211,17 @@ def _interactive_loop(images: list[Path]) -> None:
 # CLI integration
 # ---------------------------------------------------------------------------
 
-def build_inspect_parser(subparsers) -> argparse.ArgumentParser:
-    """Register the 'inspect' subcommand."""
-    sub = subparsers.add_parser(
+def add_inspect_subparser(tags_sub) -> None:
+    """Register 'inspect' as a sub-command of the 'tags' command."""
+    p = tags_sub.add_parser(
         "inspect",
         help="Interactively view images with their tags, landmarks, GPS, and date.",
     )
-    sub.add_argument("path", type=Path,
-                     help="Image file or directory to inspect")
-    sub.add_argument("-r", "--recursive", action="store_true",
-                     help="Recurse into subdirectories")
-    sub.set_defaults(func=run_inspect)
-    return sub
+    p.add_argument("path", type=Path,
+                   help="Image file or directory to inspect")
+    p.add_argument("-r", "--recursive", action="store_true",
+                   help="Recurse into subdirectories")
+    p.set_defaults(func=run_inspect)
 
 
 def run_inspect(args) -> None:

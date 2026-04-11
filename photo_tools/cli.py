@@ -25,7 +25,6 @@ def main():
 
     from photo_tools.autotag import build_tag_parser
     from photo_tools.build_landmarks import build_landmarks_parser
-    from photo_tools.debug_viewer import build_inspect_parser
     from photo_tools.drop_digikam_tags import build_drop_digikam_tags_parser
     from photo_tools.duplicates import build_similar_parser, build_tags_parser
 
@@ -34,7 +33,6 @@ def main():
     build_similar_parser(sub)
     build_landmarks_parser(sub)
     build_drop_digikam_tags_parser(sub)
-    build_inspect_parser(sub)
 
     args = parser.parse_args()
     setup_logging(verbose=args.verbose)
