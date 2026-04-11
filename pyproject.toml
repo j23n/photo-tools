@@ -25,6 +25,10 @@ dependencies = [
     "Pillow",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
+
 [project.scripts]
 photo-tools = "photo_tools.cli:main"
 
