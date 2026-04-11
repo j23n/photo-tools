@@ -7,6 +7,9 @@ quit with ``q``.
 
 import argparse
 import logging
+import os
+import platform
+import shutil
 import subprocess
 import sys
 import termios
@@ -17,6 +20,25 @@ from photo_tools.autotag import get_gps_coords, _parse_exif_datetime
 from photo_tools.helpers import find_images, get_existing_keywords, read_exif
 
 log = logging.getLogger("inspect")
+
+
+# ---------------------------------------------------------------------------
+# Image display backends
+# ---------------------------------------------------------------------------
+
+def _in_kitty() -> bool:
+    """Return True if running inside a Kitty terminal."""
+    return (os.environ.get("TERM", "") == "xterm-kitty"
+            or os.environ.get("TERM_PROGRAM", "") == "kitty")
+
+
+def _find_opener() -> list[str] | None:
+    """Return the command for the system image opener, or None."""
+    if platform.system() == "Darwin":
+        return ["open"]
+    if shutil.which("xdg-open"):
+        return ["xdg-open"]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -46,23 +68,54 @@ def _load_metadata(path: Path) -> dict:
 # Terminal display
 # ---------------------------------------------------------------------------
 
-def _display(path: Path, meta: dict, index: int, total: int) -> None:
-    """Clear screen, show image via kitten icat, and print metadata."""
-    # Clear screen
+def _display_kitty(path: Path, meta: dict, index: int, total: int) -> None:
+    """Display image inline via kitten icat and print metadata."""
     sys.stdout.write("\x1b[2J\x1b[H")
     sys.stdout.flush()
 
-    # Display image via kitten icat
-    subprocess.run(
-        ["kitten", "icat", "--clear"],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["kitten", "icat", str(path)],
-        capture_output=False,
+    subprocess.run(["kitten", "icat", "--clear"], capture_output=True)
+    subprocess.run(["kitten", "icat", str(path)], capture_output=False)
+
+    _print_meta(meta, index, total)
+
+
+def _display_external(
+    path: Path,
+    meta: dict,
+    index: int,
+    total: int,
+    opener: list[str],
+    prev_proc: "subprocess.Popen | None",
+) -> "subprocess.Popen | None":
+    """Open image in an external viewer and print metadata in the terminal.
+
+    Kills the previous viewer process (if any) before opening the new one.
+    Returns the new Popen handle so the caller can track it.
+    """
+    if prev_proc is not None:
+        try:
+            prev_proc.terminate()
+            prev_proc.wait(timeout=2)
+        except Exception:
+            try:
+                prev_proc.kill()
+            except Exception:
+                pass
+
+    sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+    proc = subprocess.Popen(
+        opener + [str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
-    # Print metadata below the image
+    _print_meta(meta, index, total)
+    return proc
+
+
+def _print_meta(meta: dict, index: int, total: int) -> None:
     print()
     print(f"  [{index + 1}/{total}] {meta['path']}")
     print(f"  Taken:     {meta['taken_at']}")
@@ -104,16 +157,32 @@ def _read_key() -> str:
 
 def _interactive_loop(images: list[Path]) -> None:
     """Cycle through images with arrow keys, quit with q."""
+    use_kitty = _in_kitty()
+    opener = None if use_kitty else _find_opener()
+
+    if not use_kitty and opener is None:
+        log.error(
+            "No image display method available. "
+            "Run inside Kitty terminal, or install xdg-open."
+        )
+        sys.exit(1)
+
     total = len(images)
     idx = 0
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+    viewer_proc: subprocess.Popen | None = None
 
     try:
         tty.setraw(fd)
         while True:
             meta = _load_metadata(images[idx])
-            _display(images[idx], meta, idx, total)
+            if use_kitty:
+                _display_kitty(images[idx], meta, idx, total)
+            else:
+                viewer_proc = _display_external(
+                    images[idx], meta, idx, total, opener, viewer_proc,
+                )
             key = _read_key()
             if key == "q":
                 break
@@ -123,9 +192,17 @@ def _interactive_loop(images: list[Path]) -> None:
                 idx = (idx - 1) % total
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        # Clear the icat image on exit
-        subprocess.run(["kitten", "icat", "--clear"], capture_output=True)
-        # Clear screen and reset cursor
+        if use_kitty:
+            subprocess.run(["kitten", "icat", "--clear"], capture_output=True)
+        elif viewer_proc is not None:
+            try:
+                viewer_proc.terminate()
+                viewer_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    viewer_proc.kill()
+                except Exception:
+                    pass
         sys.stdout.write("\x1b[2J\x1b[H")
         sys.stdout.flush()
 
