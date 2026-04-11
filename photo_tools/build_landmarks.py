@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 build_landmarks.py — Build a CLIP embedding database of notable landmarks.
 
@@ -6,17 +5,8 @@ Queries Wikidata for top landmarks (by sitelinks count), downloads multiple
 images per landmark from Wikidata properties and Wikimedia Commons categories,
 computes CLIP embeddings, averages them, and outputs landmarks.json for use
 by LandmarkIndex.
-
-Usage:
-    uv run build_landmarks.py                        # Build with defaults
-    uv run build_landmarks.py --limit 5000           # Fewer landmarks
-    uv run build_landmarks.py --output landmarks.json
-    uv run build_landmarks.py --resume               # Skip already-computed
-    uv run build_landmarks.py --test                 # Small DB with Rome+Bologna landmarks
-    uv run build_landmarks.py --images-per-landmark 5
 """
 
-import argparse
 import io
 import json
 import logging
@@ -30,16 +20,11 @@ import numpy as np
 import requests
 from PIL import Image
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+from photo_tools.config import get_config
+
 log = logging.getLogger("build_landmarks")
 
-WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
-
-# Per-type query — uses direct P31 only (no recursive P279* subclass traversal)
+# Per-type SPARQL query — uses direct P31 only (no recursive P279* subclass traversal)
 SPARQL_TYPE_QUERY = """\
 SELECT ?item ?itemLabel ?lat ?lon ?image ?sitelinks WHERE {{
   ?item wdt:P31 wd:{qid} .
@@ -94,11 +79,6 @@ LANDMARK_TYPES = [
     ("Q483110", "stadium", 1500),
 ]
 
-MAX_RETRIES = 3
-RETRY_BACKOFF = 30  # seconds
-
-TARGET_IMAGES = 10  # images per landmark for multi-image averaging
-
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 
@@ -109,22 +89,27 @@ WIKIDATA_IMAGE_PROPS = ["P18", "P3451", "P5775", "P4291"]
 SKIP_EXTENSIONS = {".svg", ".ogg", ".ogv", ".webm", ".djvu", ".pdf", ".mid",
                    ".flac", ".wav", ".tiff", ".tif"}
 
-# Geographic regions for --test mode: bounding boxes queried via Wikidata.
-# (name, lat_min, lat_max, lon_min, lon_max)
+# Geographic regions for --test mode
 TEST_REGIONS = [
     ("Rome",    41.75, 42.05, 12.30, 12.70),
     ("Bologna", 44.35, 44.65, 11.15, 11.55),
 ]
 
-TEST_LIMIT = 200
+IMAGE_CACHE_DIR = Path.home() / ".cache/photo-tools/landmark-images"
+
+_NO_THUMB_EXTS = {".tiff", ".tif", ".djvu"}
 
 
 def _sparql_get(query: str) -> list[dict]:
     """Execute a SPARQL query with retry on timeout/5xx."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    cfg = get_config()
+    max_retries = cfg.wikidata.max_retries
+    retry_backoff = cfg.wikidata.retry_backoff
+
+    for attempt in range(1, max_retries + 1):
         try:
             resp = requests.get(
-                WIKIDATA_SPARQL,
+                cfg.wikidata.sparql_url,
                 params={"query": query, "format": "json"},
                 headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
                 timeout=120,
@@ -132,23 +117,24 @@ def _sparql_get(query: str) -> list[dict]:
             resp.raise_for_status()
             return resp.json()["results"]["bindings"]
         except (requests.exceptions.HTTPError, requests.exceptions.Timeout) as e:
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 raise
             retry_after = int(getattr(getattr(e, "response", None), "headers", {}).get("Retry-After", 0))
-            wait = retry_after if retry_after else RETRY_BACKOFF * attempt
-            log.warning("Query failed (%s), retrying in %ds (%d/%d)", e, wait, attempt, MAX_RETRIES)
+            wait = retry_after if retry_after else retry_backoff * attempt
+            log.warning("Query failed (%s), retrying in %ds (%d/%d)", e, wait, attempt, max_retries)
             time.sleep(wait)
     return []  # unreachable, keeps type checkers happy
 
 
-def _api_get(url: str, params: dict, timeout: int = 30) -> dict | None:
+def _api_get(url: str, params: dict) -> dict | None:
     """GET a JSON API endpoint, retrying on 429 with Retry-After."""
+    cfg = get_config()
     for _ in range(2):
         try:
             resp = requests.get(
                 url, params=params,
                 headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
-                timeout=timeout,
+                timeout=cfg.wikidata.fetch_timeout,
             )
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 2))
@@ -170,13 +156,16 @@ def _filename_to_url(filename: str) -> str:
     return f"https://commons.wikimedia.org/wiki/Special:FilePath/{encoded}"
 
 
-def fetch_image_urls(wikidata_id: str, target: int = TARGET_IMAGES) -> list[str]:
+def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[str]:
     """Collect up to *target* image URLs for a landmark from Wikidata + Commons.
 
     Sources (in order):
       1. Wikidata image properties: P18, P3451, P5775, P4291
       2. Wikimedia Commons category (via P373) — topped up to reach *target*
     """
+    if target is None:
+        target = get_config().wikidata.target_images
+
     seen_filenames: set[str] = set()
     urls: list[str] = []
 
@@ -188,7 +177,7 @@ def fetch_image_urls(wikidata_id: str, target: int = TARGET_IMAGES) -> list[str]
         urls.append(_filename_to_url(filename))
         return True
 
-    # ── Source 1: Wikidata entity — image properties + Commons category ──
+    # Source 1: Wikidata entity — image properties + Commons category
     data = _api_get(WIKIDATA_API, {
         "action": "wbgetentities", "ids": wikidata_id,
         "props": "claims", "format": "json",
@@ -207,7 +196,7 @@ def fetch_image_urls(wikidata_id: str, target: int = TARGET_IMAGES) -> list[str]
     if len(urls) >= target:
         return urls[:target]
 
-    # ── Source 2: Wikimedia Commons category (P373 already fetched above) ──
+    # Source 2: Wikimedia Commons category (P373 already fetched above)
     category = None
     for claim in claims.get("P373", []):
         try:
@@ -228,10 +217,7 @@ def _collect_commons_category(
     remaining: int,
     depth: int = 0,
 ) -> int:
-    """Collect image files from a Commons category, recursing into subcats.
-
-    Returns number of images added.
-    """
+    """Collect image files from a Commons category, recursing into subcats."""
     if remaining <= 0 or depth > 1:
         return 0
 
@@ -289,7 +275,6 @@ def _collect_commons_category(
     if sub_data:
         for subcat in sub_data.get("query", {}).get("categorymembers", []):
             sub_title = subcat.get("title", "").removeprefix("Category:")
-            # Skip non-photo subcategories
             lower = sub_title.lower()
             if any(s in lower for s in ("plan", "map", "art", "replica", "model")):
                 continue
@@ -383,21 +368,15 @@ def query_wikidata_geo(
     return landmarks
 
 
-IMAGE_CACHE_DIR = Path.home() / ".cache/photo-tools/landmark-images"
-DOWNLOAD_WORKERS = 2
-
-
-_NO_THUMB_EXTS = {".tiff", ".tif", ".djvu"}
-
-
-def _fetch(url: str, wikidata_id: str, filename: str, timeout: int = 30) -> requests.Response | None:
+def _fetch(url: str, wikidata_id: str, filename: str) -> requests.Response | None:
     """GET *url*; retry once on 429 using Retry-After, skip on other errors."""
+    cfg = get_config()
     for _ in range(2):
         try:
             resp = requests.get(
                 url,
                 headers={"User-Agent": "photo-tools-landmark-builder/1.0"},
-                timeout=timeout,
+                timeout=cfg.wikidata.fetch_timeout,
                 stream=True,
             )
             if resp.status_code == 429:
@@ -414,15 +393,16 @@ def _fetch(url: str, wikidata_id: str, filename: str, timeout: int = 30) -> requ
     return None
 
 
-def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename: str, min_size: int = 1000) -> bool:
+def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename: str) -> bool:
     """Stream response to *dest*, returning True on success."""
+    cfg = get_config()
     IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".tmp")
     with open(tmp, "wb") as f:
         for chunk in resp.iter_content(8192):
             f.write(chunk)
     size = tmp.stat().st_size
-    if size < min_size:
+    if size < cfg.wikidata.min_image_size:
         log.warning("Downloaded image too small for %s (%s): %d bytes", wikidata_id, filename, size)
         tmp.unlink()
         return False
@@ -430,30 +410,31 @@ def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename
     return True
 
 
-def download_image(url: str, wikidata_id: str, cache_key: str | None = None,
-                   max_width: int = 512) -> tuple[Path | None, bool]:
+def download_image(url: str, wikidata_id: str, cache_key: str | None = None) -> tuple[Path | None, bool]:
     """Download a Wikimedia Commons image, resized via thumbnail API.
 
     For formats the thumbnail API cannot handle (TIFF, DjVu, …), the
     full original is downloaded and resized locally with Pillow.
 
     Images are cached in ~/.cache/photo-tools/landmark-images/.
-    *cache_key* overrides the default wikidata_id-based cache filename.
     """
+    cfg = get_config()
+    max_width = cfg.wikidata.thumbnail_max_width
+    min_size = cfg.wikidata.min_image_size
+    jpeg_quality = cfg.wikidata.thumbnail_jpeg_quality
+
     filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
     ext = Path(filename).suffix.lower()
     needs_local_resize = ext in _NO_THUMB_EXTS
 
-    # Cache as .jpg when we resize locally (original format not useful downstream)
     cache_suffix = ".jpg" if needs_local_resize else (ext or ".jpg")
     key = cache_key or wikidata_id
     cached = IMAGE_CACHE_DIR / f"{key}{cache_suffix}"
-    if cached.exists() and cached.stat().st_size >= 1000:
+    if cached.exists() and cached.stat().st_size >= min_size:
         return cached, True
 
     if needs_local_resize:
-        # Download the full original, then resize & convert to JPEG
-        resp = _fetch(url, wikidata_id, filename, timeout=120)
+        resp = _fetch(url, wikidata_id, filename)
         if resp is None:
             return None, False
         try:
@@ -462,9 +443,9 @@ def download_image(url: str, wikidata_id: str, cache_key: str | None = None,
             img = img.convert("RGB")
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             tmp = cached.with_suffix(".tmp")
-            img.save(tmp, "JPEG", quality=85)
+            img.save(tmp, "JPEG", quality=jpeg_quality)
             size = tmp.stat().st_size
-            if size < 1000:
+            if size < min_size:
                 log.warning("Resized image too small for %s (%s): %d bytes", wikidata_id, filename, size)
                 tmp.unlink()
                 return None, False
@@ -491,9 +472,14 @@ def build_database(
     resume: bool,
     wikidata_cache: Path | None = None,
     test: bool = False,
-    images_per_landmark: int = TARGET_IMAGES,
+    images_per_landmark: int | None = None,
 ) -> None:
-    from clip_tagger import CLIPEmbedder
+    """Build the landmark embedding database."""
+    from photo_tools.clip_tagger import CLIPEmbedder
+
+    cfg = get_config()
+    if images_per_landmark is None:
+        images_per_landmark = cfg.wikidata.target_images
 
     # Load existing data if resuming
     existing: dict[str, dict] = {}
@@ -505,14 +491,13 @@ def build_database(
         log.info("Resuming: %d landmarks already computed", len(existing))
 
     if test:
-        landmarks = query_wikidata_geo(TEST_REGIONS, TEST_LIMIT)
+        landmarks = query_wikidata_geo(TEST_REGIONS, cfg.wikidata.test_limit)
     elif wikidata_cache and wikidata_cache.exists():
         with open(wikidata_cache) as f:
             landmarks = json.load(f)[:limit]
         log.info("Loaded %d landmarks from %s", len(landmarks), wikidata_cache)
     else:
         landmarks = query_wikidata(limit)
-        # Dump deduped Wikidata entries for future re-use
         dump_path = output_path.with_suffix(".wikidata.json")
         dump_path.parent.mkdir(parents=True, exist_ok=True)
         with open(dump_path, "w") as f:
@@ -523,7 +508,7 @@ def build_database(
                   if lm["wikidata_id"] not in existing
                   or not existing[lm["wikidata_id"]].get("embedding")]
 
-    # ── Phase 0: collect image URLs ──
+    # Phase 0: collect image URLs
     urls_cache_path = output_path.with_suffix(".urls.json")
     landmark_urls: dict[str, list[str]] = {}
     if urls_cache_path.exists():
@@ -543,7 +528,6 @@ def build_database(
             urls = fetch_image_urls(wid, target=images_per_landmark)
             landmark_urls[wid] = urls
             log.debug("  %s: %d URLs", lm["name"], len(urls))
-            # Persist after each landmark so progress survives interrupts
             urls_cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(urls_cache_path, "w") as f:
                 json.dump(landmark_urls, f)
@@ -552,10 +536,8 @@ def build_database(
         log.info("Collected URLs for %d landmarks (total %d in cache)",
                  len(urls_to_fetch), len(landmark_urls))
 
-    # ── Download + embed in batches ──
-    # Process landmarks in batches: download images, compute embeddings,
-    # and save after each batch so progress survives interrupts.
-    BATCH_SIZE = 10
+    # Download + embed in batches
+    batch_size = cfg.wikidata.save_interval
     embedder = None  # lazy-init on first batch that needs embedding
 
     results = list(existing.values())
@@ -565,13 +547,13 @@ def build_database(
     embed_failed = 0
     total_landmarks = len(landmarks)
 
-    for batch_start in range(0, len(candidates), BATCH_SIZE):
-        batch = candidates[batch_start:batch_start + BATCH_SIZE]
-        batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (len(candidates) + BATCH_SIZE - 1) // BATCH_SIZE
+    for batch_start in range(0, len(candidates), batch_size):
+        batch = candidates[batch_start:batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+        total_batches = (len(candidates) + batch_size - 1) // batch_size
         log.info("Batch %d/%d (%d landmarks) ...", batch_num, total_batches, len(batch))
 
-        # ── Download images for this batch ──
+        # Download images for this batch
         batch_downloads: list[tuple[str, int, str]] = []
         image_paths: dict[str, list[Path]] = {}
         for lm in batch:
@@ -582,7 +564,7 @@ def build_database(
                 ext = Path(filename).suffix.lower() or ".jpg"
                 suffix = ".jpg" if ext in _NO_THUMB_EXTS else ext
                 cached = IMAGE_CACHE_DIR / f"{cache_key}{suffix}"
-                if cached.exists() and cached.stat().st_size >= 1000:
+                if cached.exists() and cached.stat().st_size >= cfg.wikidata.min_image_size:
                     image_paths.setdefault(wid, []).append(cached)
                     cached_count += 1
                 else:
@@ -598,7 +580,7 @@ def build_database(
                 img_path, was_cached = download_image(url, wid, cache_key=cache_key)
                 return wid, idx, img_path, was_cached
 
-            with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=cfg.wikidata.download_workers) as pool:
                 futures = [pool.submit(_download, t) for t in batch_downloads]
                 for future in as_completed(futures):
                     wid, idx, img_path, was_cached = future.result()
@@ -617,7 +599,7 @@ def build_database(
                               end="", flush=True, file=sys.stderr)
             print(file=sys.stderr)
 
-        # ── Embed this batch ──
+        # Embed this batch
         for lm in batch:
             wid = lm["wikidata_id"]
             paths = image_paths.get(wid, [])
@@ -675,39 +657,47 @@ def _save(output_path: Path, model: str, pretrained: str, landmarks: list[dict])
     log.info("Saved %d landmarks to %s", len(landmarks), output_path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build landmark CLIP embedding database")
-    parser.add_argument("-o", "--output", type=Path,
-                        default=Path.home() / ".local/share/photo-tools/landmarks.json")
-    parser.add_argument("-l", "--limit", type=int, default=20000,
-                        help="Max landmarks to fetch from Wikidata (default: 20000)")
-    parser.add_argument("--clip-model", default="ViT-B-32")
-    parser.add_argument("--clip-pretrained", default="laion2b_s34b_b79k")
-    parser.add_argument("--resume", action="store_true",
-                        help="Skip landmarks already in output file")
-    parser.add_argument("--wikidata-cache", type=Path, metavar="PATH",
-                        help="Load landmarks from a previous .wikidata.json instead of querying")
-    parser.add_argument("--test", action="store_true",
-                        help="Build a small database (~200 landmarks in Rome and Bologna)")
-    parser.add_argument("--images-per-landmark", type=int, default=TARGET_IMAGES,
-                        help=f"Target number of images per landmark (default: {TARGET_IMAGES})")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+def build_landmarks_parser(subparsers):
+    """Register the 'build-landmarks' subcommand."""
+    sub = subparsers.add_parser(
+        "build-landmarks",
+        help="Build CLIP embedding database of notable landmarks from Wikidata.",
+    )
+    sub.add_argument("-o", "--output", type=Path,
+                     default=Path.home() / ".local/share/photo-tools/landmarks.json",
+                     help="Output path for landmarks.json")
+    sub.add_argument("-l", "--limit", type=int, default=20000,
+                     help="Max landmarks to fetch from Wikidata (default: 20000)")
+    sub.add_argument("--clip-model", default=None,
+                     help="CLIP model name (default: from config)")
+    sub.add_argument("--clip-pretrained", default=None,
+                     help="CLIP pretrained weights (default: from config)")
+    sub.add_argument("--resume", action="store_true",
+                     help="Skip landmarks already in output file")
+    sub.add_argument("--wikidata-cache", type=Path, metavar="PATH",
+                     help="Load landmarks from a previous .wikidata.json instead of querying")
+    sub.add_argument("--test", action="store_true",
+                     help="Build a small database (~200 landmarks in Rome and Bologna)")
+    sub.add_argument("--images-per-landmark", type=int, default=None,
+                     help="Target number of images per landmark (default: from config)")
+    sub.set_defaults(func=run_build_landmarks)
+    return sub
 
+
+def run_build_landmarks(args) -> None:
+    """Execute the build-landmarks subcommand."""
+    cfg = get_config()
     build_database(
         limit=args.limit,
         output_path=args.output,
-        clip_model=args.clip_model,
-        clip_pretrained=args.clip_pretrained,
+        clip_model=args.clip_model or cfg.clip.model,
+        clip_pretrained=args.clip_pretrained or cfg.clip.pretrained,
         resume=args.resume,
         wikidata_cache=args.wikidata_cache,
         test=args.test,
         images_per_landmark=args.images_per_landmark,
     )
-
-
-if __name__ == "__main__":
-    main()

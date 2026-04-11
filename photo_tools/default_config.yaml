@@ -1,0 +1,49 @@
+clip:
+  model: "ViT-B-32"
+  pretrained: "laion2b_s34b_b79k"
+  max_pixels: 512
+
+ram:
+  image_size: 384
+  model_repo: "xinyu1205/recognize-anything-plus-model"
+  model_filename: "ram_plus_swin_large_14m.pth"
+
+ocr:
+  min_confidence: 0.60
+  high_confidence: 0.80
+  min_phrase_length: 6
+  max_tags: 10
+  max_pixels: 2000
+
+gps:
+  nominatim_zoom: 16
+  max_gap_seconds: 1800
+  geocode_cache_radius_km: 0.5
+
+landmarks:
+  radius_km: 50.0
+  threshold: 0.55
+  default_path: "~/.local/share/photo-tools/landmarks.json"
+
+similarity:
+  threshold: 0.90
+
+exiftool:
+  batch_size: 500
+  timeout: 60
+
+image:
+  jpeg_quality: 90
+
+wikidata:
+  sparql_url: "https://query.wikidata.org/sparql"
+  max_retries: 3
+  retry_backoff: 30
+  download_workers: 2
+  thumbnail_jpeg_quality: 85
+  save_interval: 10
+  min_image_size: 1000
+  thumbnail_max_width: 512
+  fetch_timeout: 30
+  target_images: 10
+  test_limit: 200

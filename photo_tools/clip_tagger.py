@@ -11,10 +11,9 @@ from pathlib import Path
 
 import numpy as np
 
-log = logging.getLogger("clip_tagger")
+from photo_tools.config import get_config
 
-DEFAULT_CLIP_MODEL = "ViT-L-14"
-DEFAULT_CLIP_PRETRAINED = "dfn2b_s39b"
+log = logging.getLogger("clip_tagger")
 
 
 class CLIPEmbedder:
@@ -22,18 +21,19 @@ class CLIPEmbedder:
 
     def __init__(
         self,
-        model_name: str = DEFAULT_CLIP_MODEL,
-        pretrained: str = DEFAULT_CLIP_PRETRAINED,
+        model_name: str | None = None,
+        pretrained: str | None = None,
     ):
         import open_clip
 
-        self.model_name = model_name
-        self.pretrained = pretrained
-        self.model_id = f"{model_name}/{pretrained}"
+        cfg = get_config()
+        self.model_name = model_name or cfg.clip.model
+        self.pretrained = pretrained or cfg.clip.pretrained
+        self.model_id = f"{self.model_name}/{self.pretrained}"
 
         log.info("Loading CLIP model %s ...", self.model_id)
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained,
+            self.model_name, pretrained=self.pretrained,
         )
         self.model.eval()
 

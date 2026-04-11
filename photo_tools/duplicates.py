@@ -9,23 +9,22 @@ Subcommands:
 import argparse
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from autotag import (
+from photo_tools.config import get_config
+from photo_tools.constants import IMAGE_EXTENSIONS
+from photo_tools.helpers import (
+    add_tags,
     find_images,
-    hierarchical_subject,
     prepare_image,
     read_cached_embedding,
     read_keywords_batch,
+    remove_tags,
     write_embedding,
-    write_keywords,
-    CLIP_MAX_PIXELS,
-    IMAGE_EXTENSIONS,
 )
 
 log = logging.getLogger("duplicates")
@@ -42,14 +41,14 @@ def load_embeddings(
     clip_model: str | None,
     clip_pretrained: str | None,
     dry_run: bool,
-) -> "dict[Path, np.ndarray]":
+) -> dict[Path, np.ndarray]:
     """Load CLIP embeddings for all paths. Reads from XMP cache first,
     falls back to computing via CLIPEmbedder for images without cached embeddings."""
+    cfg = get_config()
     result = {}
     missing = []
     total = len(paths)
 
-    # Phase 1: read cached embeddings
     for i, path in enumerate(paths, 1):
         print(f"\r  Reading embeddings {i}/{total} ...", end="", flush=True, file=sys.stderr)
         if not force:
@@ -63,17 +62,16 @@ def load_embeddings(
     if not missing:
         return result
 
-    # Phase 2: compute missing embeddings via CLIPEmbedder
     log.info("%d/%d images need embedding, loading CLIP model ...", len(missing), total)
-    from clip_tagger import CLIPEmbedder, DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
+    from photo_tools.clip_tagger import CLIPEmbedder
     embedder = CLIPEmbedder(
-        model_name=clip_model or DEFAULT_CLIP_MODEL,
-        pretrained=clip_pretrained or DEFAULT_CLIP_PRETRAINED,
+        model_name=clip_model,
+        pretrained=clip_pretrained,
     )
 
     for i, path in enumerate(missing, 1):
         print(f"\r  Embedding {i}/{len(missing)} ...", end="", flush=True, file=sys.stderr)
-        prepared = prepare_image(path, CLIP_MAX_PIXELS)
+        prepared = prepare_image(path, cfg.clip.max_pixels)
         clip_input = prepared or path
         try:
             embedding = embedder.embed_image(clip_input)
@@ -96,16 +94,15 @@ def load_embeddings(
 # ---------------------------------------------------------------------------
 
 def cluster_similar(
-    embeddings: "dict[Path, np.ndarray]",
+    embeddings: dict[Path, np.ndarray],
     threshold: float,
 ) -> list[list[Path]]:
     paths = list(embeddings.keys())
     if not paths:
         return []
     matrix = np.stack([embeddings[p] for p in paths])
-    sim = matrix @ matrix.T  # cosine similarity (vectors are L2-normalized)
+    sim = matrix @ matrix.T
 
-    # Build adjacency using union-find
     parent = list(range(len(paths)))
 
     def find(x):
@@ -134,7 +131,6 @@ def cluster_similar(
     for indices in clusters.values():
         if len(indices) < 2:
             continue
-        # Sort by file size descending (largest = likely highest quality)
         cluster_paths = sorted(
             [paths[i] for i in indices],
             key=lambda p: p.stat().st_size,
@@ -142,7 +138,6 @@ def cluster_similar(
         )
         result.append(cluster_paths)
 
-    # Sort clusters by max intra-cluster similarity descending
     def max_sim(cluster):
         idxs = [paths.index(p) for p in cluster]
         sims = [sim[idxs[a], idxs[b]] for a in range(len(idxs)) for b in range(a + 1, len(idxs))]
@@ -167,7 +162,7 @@ def interactive_similar_session(
     clusters: list[list[Path]],
     dest_root: Path,
     dry_run: bool,
-    embeddings: "dict[Path, np.ndarray]",
+    embeddings: dict[Path, np.ndarray],
 ) -> None:
     total = len(clusters)
     for i, cluster in enumerate(clusters, 1):
@@ -221,7 +216,7 @@ def interactive_similar_session(
 # tags subcommands (list, search, delete, rename)
 # ---------------------------------------------------------------------------
 
-def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
+def collect_tag_index(paths: list[Path]) -> dict[str, list[Path]]:
     index: dict[str, list[Path]] = {}
     all_keywords = read_keywords_batch(paths)
     for path in paths:
@@ -232,7 +227,7 @@ def collect_tag_index(paths: list[Path]) -> "dict[str, list[Path]]":
 
 def apply_tag_change(
     old: str,
-    new: "str | None",
+    new: str | None,
     files: list[Path],
     dry_run: bool,
 ) -> None:
@@ -243,17 +238,11 @@ def apply_tag_change(
         log.info("[DRY RUN] Would %s '%s' in %d file(s)", action, old, len(files))
         return
 
-    args = ["exiftool", "-overwrite_original"]
-    args.append(f"-IPTC:Keywords-={old}")
-    args.append(f"-XMP-dc:Subject-={old}")
-    args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(old)}")
-    args.append(f"-XMP-digiKam:TagsList-={old}")
-    args.extend(str(f) for f in files)
-    subprocess.run(args, capture_output=True, timeout=120)
+    remove_tags(files, [old], dry_run=dry_run)
 
     if new:
         for path in files:
-            write_keywords(path, [new], dry_run=False)
+            add_tags(path, [new], dry_run=False)
 
 
 def bulk_delete_tags(
@@ -261,27 +250,19 @@ def bulk_delete_tags(
     files: list[Path],
     dry_run: bool,
 ) -> None:
-    """Delete multiple tags from multiple files in a single exiftool call per batch."""
+    """Delete multiple tags from multiple files."""
     if not files or not tags:
         return
     if dry_run:
         log.info("[DRY RUN] Would delete %d tag(s) from %d file(s)", len(tags), len(files))
         return
 
-    BATCH_SIZE = 500
     total = len(files)
-    for i in range(0, total, BATCH_SIZE):
-        batch = files[i:i + BATCH_SIZE]
-        args = ["exiftool", "-overwrite_original"]
-        for tag in tags:
-            args.append(f"-IPTC:Keywords-={tag}")
-            args.append(f"-XMP-dc:Subject-={tag}")
-            args.append(f"-XMP-lr:HierarchicalSubject-={hierarchical_subject(tag)}")
-            args.append(f"-XMP-digiKam:TagsList-={tag}")
-        args.extend(str(f) for f in batch)
+    for i in range(0, total, get_config().exiftool.batch_size):
+        batch = files[i:i + get_config().exiftool.batch_size]
         print(f"\r  Deleting tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
               end="", flush=True, file=sys.stderr)
-        subprocess.run(args, capture_output=True, timeout=300)
+        remove_tags(batch, tags, dry_run=dry_run)
     print(file=sys.stderr)
 
 
@@ -303,8 +284,6 @@ def run_list_tags(args) -> None:
 
 
 def run_delete_tag(args) -> None:
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
     if not args.tag and not args.pattern:
         log.error("Provide a tag name or --pattern")
         sys.exit(1)
@@ -329,7 +308,8 @@ def run_delete_tag(args) -> None:
             sys.exit(1)
         matched_tags = sorted(matched.keys())
         affected_files = list({f for files in matched.values() for f in files})
-        log.info("Pattern '%s' matched %d tag(s) across %d file(s):", args.pattern, len(matched_tags), len(affected_files))
+        log.info("Pattern '%s' matched %d tag(s) across %d file(s):",
+                 args.pattern, len(matched_tags), len(affected_files))
         for tag in matched_tags:
             log.info("  %s  (%d files)", tag, len(matched[tag]))
         bulk_delete_tags(matched_tags, affected_files, args.dry_run)
@@ -346,8 +326,6 @@ def run_delete_tag(args) -> None:
 
 
 def run_rename_tag(args) -> None:
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
     paths = find_images(args.path, args.recursive)
     if not paths:
         log.error("No supported images found at %s", args.path)
@@ -366,8 +344,6 @@ def run_rename_tag(args) -> None:
 
 
 def run_search_tags(args) -> None:
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
     paths = find_images(args.path, args.recursive)
     if not paths:
         log.error("No supported images found at %s", args.path)
@@ -390,48 +366,37 @@ def run_search_tags(args) -> None:
 # ---------------------------------------------------------------------------
 
 def build_tags_parser(subparsers) -> None:
-    """Register the 'tags' subcommand group with list/delete/rename/search."""
     tags_parser = subparsers.add_parser(
         "tags",
         help="Tag management: list, search, delete, rename.",
     )
     tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
 
-    # tags list
     p = tags_sub.add_parser("list", help="List all tags with file counts.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=run_list_tags)
 
-    # tags search
     p = tags_sub.add_parser("search", help="List files that have a given tag.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", help="Tag to search for")
     p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=run_search_tags)
 
-    # tags delete
-    p = tags_sub.add_parser("delete", help="Delete a tag (or tags matching a regex pattern) from all files.")
+    p = tags_sub.add_parser("delete", help="Delete a tag (or regex pattern) from all files.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", nargs="?", help="Exact tag to delete")
     p.add_argument("-p", "--pattern", help="Regex pattern to match tags for deletion")
     p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("-n", "--dry-run", action="store_true",
-                   help="Preview changes without writing")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_delete_tag)
 
-    # tags rename
     p = tags_sub.add_parser("rename", help="Rename a tag across all files.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("old", help="Tag to rename")
     p.add_argument("new", help="New tag name")
     p.add_argument("-r", "--recursive", action="store_true")
-    p.add_argument("-n", "--dry-run", action="store_true",
-                   help="Preview changes without writing")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_rename_tag)
 
 
@@ -444,29 +409,26 @@ def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub.add_argument("-r", "--recursive", action="store_true")
     sub.add_argument("-n", "--dry-run", action="store_true",
                      help="Preview moves without executing")
-    sub.add_argument("--threshold", type=float, default=0.90,
-                     help="Cosine similarity cutoff (default: 0.90)")
+    sub.add_argument("--threshold", type=float, default=None,
+                     help="Cosine similarity cutoff (default: from config)")
     sub.add_argument("--dest", type=Path, default=None,
                      help="Destination directory for moved duplicates")
     sub.add_argument("--force", action="store_true",
                      help="Re-embed even if a cached embedding exists")
     sub.add_argument("--clip-model", default=None,
-                     help="CLIP model name (default: ViT-B-32)")
+                     help="CLIP model name (default: from config)")
     sub.add_argument("--clip-pretrained", default=None,
-                     help="CLIP pretrained weights (default: laion2b_s34b_b79k)")
-    sub.add_argument("-v", "--verbose", action="store_true")
+                     help="CLIP pretrained weights (default: from config)")
     sub.set_defaults(func=run_find_similar)
     return sub
 
 
 def run_find_similar(args) -> None:
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    from clip_tagger import DEFAULT_CLIP_MODEL, DEFAULT_CLIP_PRETRAINED
-    clip_model = args.clip_model or DEFAULT_CLIP_MODEL
-    clip_pretrained = args.clip_pretrained or DEFAULT_CLIP_PRETRAINED
+    cfg = get_config()
+    clip_model = args.clip_model or cfg.clip.model
+    clip_pretrained = args.clip_pretrained or cfg.clip.pretrained
     model_id = f"{clip_model}/{clip_pretrained}"
+    threshold = args.threshold if args.threshold is not None else cfg.similarity.threshold
 
     all_files = find_images(args.path, args.recursive)
     image_paths = [p for p in all_files if p.suffix.lower() in IMAGE_EXTENSIONS]
@@ -483,8 +445,8 @@ def run_find_similar(args) -> None:
         dry_run=args.dry_run,
     )
 
-    log.info("Clustering similar images (threshold=%.2f) ...", args.threshold)
-    clusters = cluster_similar(embeddings, args.threshold)
+    log.info("Clustering similar images (threshold=%.2f) ...", threshold)
+    clusters = cluster_similar(embeddings, threshold)
 
     if not clusters:
         log.info("No similar image clusters found.")

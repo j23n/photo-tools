@@ -12,9 +12,9 @@ from pathlib import Path
 
 import numpy as np
 
-log = logging.getLogger("landmarks")
+from photo_tools.config import get_config
 
-DEFAULT_LANDMARKS_PATH = Path.home() / ".local/share/photo-tools/landmarks.json"
+log = logging.getLogger("landmarks")
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -31,8 +31,10 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class LandmarkIndex:
     """FAISS-backed landmark lookup using CLIP embeddings."""
 
-    def __init__(self, landmarks_path: Path = DEFAULT_LANDMARKS_PATH):
-        import faiss
+    def __init__(self, landmarks_path: Path | None = None):
+        cfg = get_config()
+        if landmarks_path is None:
+            landmarks_path = Path(cfg.landmarks.default_path).expanduser()
 
         log.info("Loading landmark database from %s ...", landmarks_path)
         with open(landmarks_path) as f:
@@ -55,21 +57,17 @@ class LandmarkIndex:
         embedding: np.ndarray,
         lat: float,
         lon: float,
-        radius_km: float = 50.0,
-        threshold: float = 0.55,
+        radius_km: float | None = None,
+        threshold: float | None = None,
     ) -> str | None:
-        """Find the best matching landmark for an image embedding.
-
-        Args:
-            embedding: L2-normalized CLIP image embedding.
-            lat, lon: GPS coordinates of the photo.
-            radius_km: Only consider landmarks within this radius of GPS coords.
-            threshold: Minimum cosine similarity to return a match.
-
-        Returns:
-            Landmark name or None.
-        """
+        """Find the best matching landmark for an image embedding."""
         import faiss
+
+        cfg = get_config()
+        if radius_km is None:
+            radius_km = cfg.landmarks.radius_km
+        if threshold is None:
+            threshold = cfg.landmarks.threshold
 
         embedding = embedding.reshape(1, -1).astype(np.float32)
 
