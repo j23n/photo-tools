@@ -3253,10 +3253,7 @@
     "category": "animal",
     "tag": "horse"
   },
-  "pillar": {
-    "category": "object",
-    "tag": "pillar"
-  },
+  "pillar": null,
   "comb": {
     "category": "object",
     "tag": "comb"
@@ -6994,10 +6991,7 @@
   },
   "interaction": null,
   "interior design": null,
-  "website": {
-    "category": "other",
-    "tag": "screenshot"
-  },
+  "website": null,
   "intersection": {
     "category": "scene",
     "tag": "intersection"
@@ -11275,10 +11269,7 @@
     "category": "object",
     "tag": "door"
   },
-  "screenshot": {
-    "category": "other",
-    "tag": "screenshot"
-  },
+  "screenshot": null,
   "screw": null,
   "screwdriver": {
     "category": "object",

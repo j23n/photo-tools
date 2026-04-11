@@ -21,8 +21,8 @@ gps:
   geocode_cache_radius_km: 0.5
 
 landmarks:
-  radius_km: 50.0
-  threshold: 0.55
+  radius_km: 5.0
+  threshold: 0.65
   default_path: "~/.local/share/photo-tools/landmarks.json"
 
 similarity:
@@ -46,4 +46,25 @@ wikidata:
   thumbnail_max_width: 512
   fetch_timeout: 30
   target_images: 10
-  test_limit: 200
+  test_limit: 100
+  test_per_type_limit: 20
+  commons_subcat_blocklist:
+    - plan
+    - map
+    - art
+    - replica
+    - model
+    - historical
+    - drawing
+    - engraving
+    - event
+    - stamp
+    - logo
+    - coin
+    - medal
+    - poster
+    - painting
+    - fresco
+    - reconstruction
+    - diagram
+    - schematic

@@ -454,9 +454,12 @@ def extract_video_frame(path: Path) -> Path | None:
 # CLIP embedding cache (stored in XMP, reused by find-similar)
 # ---------------------------------------------------------------------------
 
+_EXIFTOOL_CONFIG = Path(__file__).with_name("exiftool_phototools.config")
+
+
 def read_clip_cache(path: Path) -> dict:
     result = subprocess.run(
-        ["exiftool", "-j",
+        ["exiftool", "-config", str(_EXIFTOOL_CONFIG), "-j",
          "-XMP-phototools:CLIPEmbedding",
          "-XMP-phototools:CLIPModel",
          "-XMP-phototools:CLIPTimestamp",
@@ -492,14 +495,17 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
         log.info("[DRY RUN] Would cache embedding for %s", path.name)
         return
     cfg = get_config()
-    subprocess.run(
-        ["exiftool", "-overwrite_original",
+    result = subprocess.run(
+        ["exiftool", "-config", str(_EXIFTOOL_CONFIG), "-overwrite_original",
          f"-XMP-phototools:CLIPEmbedding={b64}",
          f"-XMP-phototools:CLIPModel={model}",
          f"-XMP-phototools:CLIPTimestamp={ts}",
          str(path)],
-        capture_output=True, timeout=cfg.exiftool.timeout,
+        capture_output=True, text=True, timeout=cfg.exiftool.timeout,
     )
+    if result.returncode != 0:
+        log.warning("Failed to cache embedding for %s: %s",
+                    path.name, result.stderr.strip())
 
 
 # ---------------------------------------------------------------------------

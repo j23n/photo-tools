@@ -687,10 +687,6 @@ def process_single(
             except Exception as e:
                 log.debug("Landmark lookup failed: %s", e)
 
-    if embedding is not None and not dry_run:
-        model_id = _get_clip_embedder(clip_model, clip_pretrained).model_id
-        write_embedding(path, embedding, model_id, dry_run)
-
     if frame_path:
         try:
             os.unlink(frame_path)
@@ -703,13 +699,19 @@ def process_single(
     if AI_TAG_MARKER not in existing:
         new_tags.append(AI_TAG_MARKER)
 
-    if not new_tags:
+    ok = True
+    if new_tags:
+        ok = add_tags(path, new_tags, dry_run)
+        if ok and ocr_regions:
+            write_text_regions(path, ocr_regions, dry_run)
+    else:
         log.info("No new keywords for %s", path.name)
-        return True
 
-    ok = add_tags(path, new_tags, dry_run)
-    if ok and ocr_regions:
-        write_text_regions(path, ocr_regions, dry_run)
+    # Write embedding last — after all other exiftool calls that rewrite XMP.
+    if embedding is not None and not dry_run:
+        model_id = _get_clip_embedder(clip_model, clip_pretrained).model_id
+        write_embedding(path, embedding, model_id, dry_run)
+
     return ok
 
 
