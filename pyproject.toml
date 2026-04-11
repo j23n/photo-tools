@@ -29,6 +29,9 @@ dependencies = [
 requires = ["uv_build>=0.7.2,<0.8"]
 build-backend = "uv_build"
 
+[tool.uv-build]
+module-root = ""
+
 [project.scripts]
 photo-tools = "photo_tools.cli:main"
 
