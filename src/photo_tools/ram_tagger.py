@@ -77,7 +77,13 @@ class RAMTagger:
         return self._map_tags(raw_tags)
 
     def _map_tags(self, raw_tags: list[str]) -> list[str]:
-        """Map RAM++ tag strings to prefixed taxonomy tags."""
+        """Map RAM++ tag strings to hierarchical taxonomy tags.
+
+        Output is `<Category>/<Tag>` (Titlecase, see docs/xmp-schema.md §2).
+        Per-category `max_tags` is enforced. Per-category `min_confidence`
+        from taxonomy.py is *not* yet enforced — `inference_ram` returns
+        only tag names, not scores. Wiring score extraction is a follow-up.
+        """
         by_category: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for i, raw in enumerate(raw_tags):
             entry = self._mapping.get(raw)
