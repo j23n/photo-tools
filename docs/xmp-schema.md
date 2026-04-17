@@ -159,7 +159,7 @@ numerals, and acronyms out of the box.
 ## 4. Migration
 
 Existing files written by older versions of photo-tools must be cleaned up
-once before re-tagging. Scripts under `scripts/migrate_xmp.sh` do this in two
+once before re-tagging. `scripts/migrate_xmp.py` does this in two
 stages:
 
 1. **Strip** the legacy `photo-tools` XMP namespace contents (any URI),
