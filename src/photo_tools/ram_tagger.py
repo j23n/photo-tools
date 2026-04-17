@@ -6,17 +6,18 @@ multi-label recognition model. Uses a JSON mapping to convert RAM++
 tag predictions to the hierarchical taxonomy (category/tag format).
 """
 
-import json
 import logging
 from collections import defaultdict
 from pathlib import Path
+
+import yaml
 
 from photo_tools.config import get_config
 from photo_tools.taxonomy import get_max_tags
 
 log = logging.getLogger("ram_tagger")
 
-_MAPPING_PATH = Path(__file__).parent / "data" / "ram_tag_mapping.json"
+_MAPPING_PATH = Path(__file__).parent / "data" / "ram_tag_mapping.yaml"
 
 
 class RAMTagger:
@@ -45,7 +46,7 @@ class RAMTagger:
         self.transform = get_transform(image_size=self.image_size)
 
         with open(_MAPPING_PATH) as f:
-            self._mapping = json.load(f)
+            self._mapping = yaml.safe_load(f)
         mapped_count = sum(1 for v in self._mapping.values() if v is not None)
         log.info("RAM++ loaded: %d mapped tags, %d skipped",
                  mapped_count, len(self._mapping) - mapped_count)
