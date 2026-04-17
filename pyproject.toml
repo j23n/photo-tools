@@ -23,6 +23,7 @@ dependencies = [
     "timm==0.4.12",
     "fairscale==0.4.4",
     "Pillow",
+    "titlecase>=2.4",
 ]
 
 [build-system]

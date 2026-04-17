@@ -20,15 +20,27 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from photo_tools.constants import ALL_PREFIXES, BARE_TAGS, CATEGORY_NAMES
+from photo_tools.constants import (
+    ALL_OUR_ROOTS,
+    LEGACY_BARE_TAGS,
+    LEGACY_PREFIXES,
+    LEGACY_ROOT_NAMES,
+    OUR_TAG_ROOT_NAMES,
+)
 
 log = logging.getLogger("drop_digikam_tags")
+
+# Lower-cased versions of the photo-tools-owned roots — used to match against
+# raw tag-tree paths (which may carry mixed case from older versions).
+_OUR_PREFIXES_LOWER = tuple(r.lower() for r in ALL_OUR_ROOTS)
+_ALL_PREFIXES_LOWER = _OUR_PREFIXES_LOWER + LEGACY_PREFIXES
+_ALL_ROOT_NAMES = OUR_TAG_ROOT_NAMES | LEGACY_ROOT_NAMES
 
 
 def is_our_tag_name(name: str) -> bool:
     """Return True if *name* (a single DigiKam tag node name) is one we own."""
     low = name.lower()
-    return low in BARE_TAGS or low in CATEGORY_NAMES
+    return low in LEGACY_BARE_TAGS or low in _ALL_ROOT_NAMES
 
 
 def build_tag_tree(cur: sqlite3.Cursor) -> dict:
@@ -90,21 +102,22 @@ def collect_our_tags(nodes: dict, people_ids: set[int]) -> set[int]:
     """
     ours: set[int] = set()
 
-    # Pass 1: tag nodes whose full path matches autotag patterns
+    # Pass 1: tag nodes whose full path matches autotag patterns (current or legacy).
     for tid, node in nodes.items():
         if tid in people_ids:
             continue
         full = tag_full_path(nodes, tid)
         low = full.lower()
-        if low in BARE_TAGS:
+        if low in LEGACY_BARE_TAGS:
             ours.add(tid)
             continue
-        for prefix in ALL_PREFIXES:
+        for prefix in _ALL_PREFIXES_LOWER:
             if low.startswith(prefix) or low == prefix.rstrip("/"):
                 ours.add(tid)
                 break
 
-    # Pass 2: collect category parent nodes that are now empty.
+    # Pass 2: collect root parent nodes that are now empty (e.g. the bare
+    # 'Places' or legacy 'country' node after all its children are removed).
     changed = True
     while changed:
         changed = False
@@ -112,7 +125,7 @@ def collect_our_tags(nodes: dict, people_ids: set[int]) -> set[int]:
             if tid in ours or tid in people_ids:
                 continue
             name_low = node["name"].lower()
-            if name_low not in CATEGORY_NAMES:
+            if name_low not in _ALL_ROOT_NAMES:
                 continue
             remaining = [c for c in node["children"] if c not in ours]
             if not remaining:

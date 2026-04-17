@@ -1,4 +1,7 @@
-"""Shared constants for photo-tools."""
+"""Shared constants for photo-tools.
+
+See docs/xmp-schema.md for the XMP/IPTC schema this tool emits.
+"""
 
 import re
 
@@ -10,11 +13,28 @@ VIDEO_EXTENSIONS = {
 }
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
-AI_TAG_MARKER = "ai:tagged"
+# Tagger version. Bump on any schema change (see docs/xmp-schema.md §6).
+# Stored in photo-tools:TaggerVersion; presence acts as the "already tagged"
+# sentinel and a mismatched value triggers automatic re-tagging.
+TAGGER_VERSION = "2026.1"
 
-# All known tag prefixes — used to identify and clear our tags on --force.
-# Uses / separator for DigiKam hierarchical tag support.
-ALL_PREFIXES = (
+# Top-level taxonomy roots we own (digiKam:TagsList prefixes). People/ is
+# digiKam-owned and intentionally absent from this list.
+OUR_TAG_ROOTS = ("Places/", "Objects/", "Scenes/")
+
+# OCR text tags use a separate root for tag-tree organization.
+OCR_TAG_ROOT = "Text/"
+
+ALL_OUR_ROOTS = OUR_TAG_ROOTS + (OCR_TAG_ROOT,)
+
+# Top-level node names corresponding to our roots (used to garbage-collect
+# now-empty parent nodes in digiKam's tag tree).
+OUR_TAG_ROOT_NAMES = {r.rstrip("/").lower() for r in ALL_OUR_ROOTS}
+
+# Pre-2026.1 keyword prefixes / bare names. Only used by the migration paths
+# (scripts/migrate_xmp.sh and drop_digikam_tags) to clean up files written by
+# older versions. Do not extend this for new functionality.
+LEGACY_PREFIXES = (
     "country/", "cc/", "region/", "city/", "neighborhood/",
     "landmark/", "scene/", "setting/",
     "object/", "animal/", "plant/", "vehicle/", "food/", "other/",
@@ -24,23 +44,8 @@ ALL_PREFIXES = (
     "year/", "month/", "day/",
     "flash/",
 )
-
-# Bare (unprefixed) tags we manage
-BARE_TAGS = {"weekend", "weekday", "screenshot", "video", AI_TAG_MARKER}
-
-# Top-level category names derived from prefixes
-CATEGORY_NAMES = {p.rstrip("/") for p in ALL_PREFIXES}
-
-SCREENSHOT_RESOLUTIONS = {
-    (1170, 2532), (1284, 2778), (1179, 2556), (1290, 2796),
-    (1242, 2688), (1125, 2436), (1080, 1920), (750, 1334),
-    (1242, 2208), (828, 1792),
-    (2048, 2732), (1668, 2388), (1668, 2224), (1620, 2160), (1536, 2048),
-    (1920, 1080), (2560, 1440), (3840, 2160), (1440, 900),
-    (2560, 1600), (1680, 1050), (3024, 1964), (2880, 1800),
-    (1080, 2400), (1080, 2340), (1440, 3200), (1440, 3088),
-    (1080, 2280), (1440, 2960),
-}
+LEGACY_BARE_TAGS = {"weekend", "weekday", "screenshot", "video", "ai:tagged"}
+LEGACY_ROOT_NAMES = {p.rstrip("/").lower() for p in LEGACY_PREFIXES}
 
 # OCR validation patterns
 OCR_WORD_PATTERN = re.compile(r"^[a-zA-Z0-9À-ÿ][a-zA-Z0-9À-ÿ'.&@#%\-]{0,30}$")

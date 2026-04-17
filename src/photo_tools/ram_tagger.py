@@ -6,17 +6,18 @@ multi-label recognition model. Uses a JSON mapping to convert RAM++
 tag predictions to the hierarchical taxonomy (category/tag format).
 """
 
-import json
 import logging
 from collections import defaultdict
 from pathlib import Path
+
+import yaml
 
 from photo_tools.config import get_config
 from photo_tools.taxonomy import get_max_tags
 
 log = logging.getLogger("ram_tagger")
 
-_MAPPING_PATH = Path(__file__).parent / "data" / "ram_tag_mapping.json"
+_MAPPING_PATH = Path(__file__).parent / "data" / "ram_tag_mapping.yaml"
 
 
 class RAMTagger:
@@ -45,7 +46,7 @@ class RAMTagger:
         self.transform = get_transform(image_size=self.image_size)
 
         with open(_MAPPING_PATH) as f:
-            self._mapping = json.load(f)
+            self._mapping = yaml.safe_load(f)
         mapped_count = sum(1 for v in self._mapping.values() if v is not None)
         log.info("RAM++ loaded: %d mapped tags, %d skipped",
                  mapped_count, len(self._mapping) - mapped_count)
@@ -77,7 +78,13 @@ class RAMTagger:
         return self._map_tags(raw_tags)
 
     def _map_tags(self, raw_tags: list[str]) -> list[str]:
-        """Map RAM++ tag strings to prefixed taxonomy tags."""
+        """Map RAM++ tag strings to hierarchical taxonomy tags.
+
+        Output is `<Category>/<Tag>` (Titlecase, see docs/xmp-schema.md §2).
+        Per-category `max_tags` is enforced. Per-category `min_confidence`
+        from taxonomy.py is *not* yet enforced — `inference_ram` returns
+        only tag names, not scores. Wiring score extraction is a follow-up.
+        """
         by_category: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for i, raw in enumerate(raw_tags):
             entry = self._mapping.get(raw)

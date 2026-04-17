@@ -20,11 +20,10 @@ import requests
 
 from photo_tools.config import get_config
 from photo_tools.constants import (
-    AI_TAG_MARKER,
     IMAGE_EXTENSIONS,
     OCR_VOWELS,
     OCR_WORD_PATTERN,
-    SCREENSHOT_RESOLUTIONS,
+    TAGGER_VERSION,
     VALID_ONSETS,
 )
 from photo_tools.helpers import (
@@ -35,13 +34,26 @@ from photo_tools.helpers import (
     extract_video_frame,
     find_images,
     get_existing_keywords,
+    get_tagger_version,
     is_our_tag,
     is_video,
+    leaf_of,
     prepare_image,
     read_exif,
     remove_tags,
     write_embedding,
 )
+
+try:
+    from titlecase import titlecase as _titlecase
+except ImportError:  # pragma: no cover - dependency declared in pyproject
+    def _titlecase(s: str) -> str:
+        return s.title()
+
+
+def title(s: str) -> str:
+    """Titlecase a path segment (geocoder value, tag leaf)."""
+    return _titlecase(s.strip())
 
 log = logging.getLogger("autotag")
 
@@ -70,65 +82,6 @@ def _is_plausible_word(word: str) -> bool:
     if digits > len(w) / 2:
         return False
     return True
-
-
-# ---------------------------------------------------------------------------
-# EXIF-derived tags
-# ---------------------------------------------------------------------------
-
-def tags_from_exif(exif: dict) -> list[str]:
-    tags = []
-
-    date_str = exif.get("DateTimeOriginal") or exif.get("CreateDate")
-    if date_str and isinstance(date_str, str) and len(date_str) >= 10:
-        try:
-            import datetime as dt_mod
-            clean = date_str.replace("-", ":").replace("T", " ")
-            parts = clean.split(":")
-            if len(parts) >= 3:
-                year = int(parts[0])
-                month = int(parts[1])
-                day = int(parts[2].split()[0])
-                tags.append(f"year/{year}")
-                month_names = [
-                    "", "january", "february", "march", "april", "may", "june",
-                    "july", "august", "september", "october", "november", "december",
-                ]
-                if 1 <= month <= 12:
-                    tags.append(f"month/{month_names[month]}")
-                try:
-                    d = dt_mod.date(year, month, day)
-                    day_names = ["monday", "tuesday", "wednesday", "thursday",
-                                 "friday", "saturday", "sunday"]
-                    tags.append(f"day/{day_names[d.weekday()]}")
-                    tags.append("weekend" if d.weekday() >= 5 else "weekday")
-                except ValueError:
-                    pass
-        except (ValueError, IndexError):
-            pass
-
-    flash = exif.get("Flash")
-    if flash is not None:
-        try:
-            if int(flash) & 1:
-                tags.append("flash/fired")
-        except (ValueError, TypeError):
-            if "fired" in str(flash).lower() and "not" not in str(flash).lower():
-                tags.append("flash/fired")
-
-    width = exif.get("ImageWidth") or exif.get("File:ImageWidth")
-    height = exif.get("ImageHeight") or exif.get("File:ImageHeight")
-    if width and height:
-        try:
-            w, h = int(width), int(height)
-            has_camera = bool((exif.get("Make") or "").strip())
-            if not has_camera and ((w, h) in SCREENSHOT_RESOLUTIONS
-                                  or (h, w) in SCREENSHOT_RESOLUTIONS):
-                tags.append("screenshot")
-        except (ValueError, TypeError):
-            pass
-
-    return tags
 
 
 # ---------------------------------------------------------------------------
@@ -279,36 +232,49 @@ def reverse_geocode(lat: float, lon: float) -> dict:
     return addr
 
 
-def tags_from_gps(exif: dict) -> list[str]:
+def tags_from_gps(exif: dict) -> tuple[list[str], str | None]:
+    """Return (places_tags, country_code).
+
+    `places_tags` is a list with at most one entry — the single nested
+    `Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]` path with missing
+    levels collapsed. `country_code` is the ISO 3166-1 alpha-2 code (uppercase)
+    or None; it is written separately to photo-tools:CountryCode.
+    """
     coords = get_gps_coords(exif)
     if coords is None:
-        return []
+        return [], None
     lat, lon = coords
     log.debug("GPS: %.5f, %.5f", lat, lon)
     address = reverse_geocode(lat, lon)
     if not address:
-        return []
+        return [], None
 
-    tags = []
+    segments = []
     country = address.get("country")
     if country:
-        tags.append(f"country/{country.lower()}")
-    cc = address.get("country_code")
-    if cc:
-        tags.append(f"cc/{cc.lower()}")
+        segments.append(title(country))
+
     region = (address.get("state") or address.get("region")
               or address.get("province") or address.get("county"))
     if region:
-        tags.append(f"region/{region.lower()}")
+        segments.append(title(region))
+
     city = (address.get("city") or address.get("town")
             or address.get("village") or address.get("municipality"))
     if city:
-        tags.append(f"city/{city.lower()}")
+        segments.append(title(city))
+
     neighborhood = (address.get("suburb") or address.get("neighbourhood")
                     or address.get("quarter") or address.get("district"))
     if neighborhood:
-        tags.append(f"neighborhood/{neighborhood.lower()}")
-    return tags
+        segments.append(title(neighborhood))
+
+    places = ["Places/" + "/".join(segments)] if segments else []
+
+    cc = address.get("country_code")
+    country_code = cc.upper() if cc else None
+
+    return places, country_code
 
 
 # ---------------------------------------------------------------------------
@@ -394,13 +360,14 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
             if len(good_words) == 1 and score < cfg.ocr.high_confidence:
                 continue
 
-            phrase = " ".join(good_words).lower().strip()
+            phrase = " ".join(good_words).strip()
             if len(phrase) < cfg.ocr.min_phrase_length:
                 continue
-            if phrase in seen:
+            phrase_key = phrase.lower()
+            if phrase_key in seen:
                 continue
-            seen.add(phrase)
-            tags.append(f"text/{phrase}")
+            seen.add(phrase_key)
+            tags.append(f"Text/{title(phrase)}")
 
             poly_arr = np.array(poly)
             x_min, y_min = poly_arr.min(axis=0)
@@ -600,9 +567,11 @@ def process_single(
 
     exif = read_exif(path)
     existing = get_existing_keywords(exif)
+    stored_version = get_tagger_version(exif)
 
-    if AI_TAG_MARKER in existing and not force and not clear_all:
-        log.info("Skipping %s (already tagged, use --force to re-tag)", path.name)
+    if (stored_version == TAGGER_VERSION and not force and not clear_all):
+        log.info("Skipping %s (already tagged with %s, use --force to re-tag)",
+                 path.name, stored_version)
         return False
 
     if clear_all and existing:
@@ -611,32 +580,25 @@ def process_single(
     elif force and existing:
         to_remove = [tag for tag in existing if is_our_tag(tag)]
         if to_remove:
-            remove_tags([path], to_remove, also_remove_leaves=True, dry_run=dry_run)
-        our_tags = {t for t in existing if is_our_tag(t)}
-        our_leaves = {t.rsplit("/", 1)[-1] for t in our_tags if "/" in t}
-        existing = existing - our_tags - our_leaves
+            remove_tags([path], to_remove, dry_run=dry_run)
+        our_leaves = {leaf_of(t).lower() for t in existing if is_our_tag(t)}
+        existing = existing - our_leaves
 
     log.info("Processing %s ...", path.name)
-    all_tags = []
+    all_tags: list[str] = []
 
     frame_path = None
     if video:
-        all_tags.append("video")
         frame_path = extract_video_frame(path)
         if frame_path is None:
             log.warning("Could not extract frame from %s, running EXIF/GPS only", path.name)
 
     visual_path = frame_path if video else path
 
-    t = tags_from_exif(exif)
-    if t:
-        log.debug("  EXIF: %s", t)
-        all_tags.extend(t)
-
-    t = tags_from_gps(exif)
-    if t:
-        log.debug("  Geo:  %s", t)
-        all_tags.extend(t)
+    places, country_code = tags_from_gps(exif)
+    if places:
+        log.debug("  Geo:  %s", places)
+        all_tags.extend(places)
 
     ocr_regions = []
     if enable_ocr and visual_path:
@@ -681,7 +643,13 @@ def process_single(
                 if lm_index is not None:
                     landmark = lm_index.lookup(embedding, lat=lat, lon=lon)
                     if landmark:
-                        tag = f"landmark/{landmark.lower().replace(' ', '-')}"
+                        # Surface landmarks under Places/ alongside reverse-
+                        # geocoded paths. The landmark name itself becomes the
+                        # leaf — e.g. "Places/Italy/Lazio/Rome/Colosseum".
+                        if places:
+                            tag = f"{places[0]}/{title(landmark)}"
+                        else:
+                            tag = f"Places/{title(landmark)}"
                         log.debug("  Landmark: %s", tag)
                         all_tags.append(tag)
             except Exception as e:
@@ -694,14 +662,15 @@ def process_single(
             pass
 
     all_tags = deduplicate(all_tags)
-    new_tags = [t for t in all_tags if t.lower() not in existing]
+    new_tags = [t for t in all_tags if leaf_of(t).lower() not in existing]
 
-    if AI_TAG_MARKER not in existing:
-        new_tags.append(AI_TAG_MARKER)
+    namespace_fields: dict[str, str] = {}
+    if country_code:
+        namespace_fields["CountryCode"] = country_code
 
     ok = True
-    if new_tags:
-        ok = add_tags(path, new_tags, dry_run)
+    if new_tags or namespace_fields or stored_version != TAGGER_VERSION:
+        ok = add_tags(path, new_tags, dry_run, namespace_fields=namespace_fields)
         if ok and ocr_regions:
             write_text_regions(path, ocr_regions, dry_run)
     else:
@@ -726,8 +695,7 @@ def watch_directory(target, recursive, dry_run,
     seen: set[Path] = set()
 
     for img in find_images(target, recursive):
-        exif = read_exif(img)
-        if AI_TAG_MARKER in get_existing_keywords(exif):
+        if get_tagger_version(read_exif(img)) == TAGGER_VERSION:
             seen.add(img.resolve())
     log.info("Found %d already-tagged images, skipping those.", len(seen))
 
@@ -737,8 +705,7 @@ def watch_directory(target, recursive, dry_run,
                 resolved = img.resolve()
                 if resolved in seen:
                     continue
-                exif = read_exif(img)
-                if AI_TAG_MARKER in get_existing_keywords(exif):
+                if get_tagger_version(read_exif(img)) == TAGGER_VERSION:
                     seen.add(resolved)
                     continue
                 process_single(img, dry_run, force=False,
