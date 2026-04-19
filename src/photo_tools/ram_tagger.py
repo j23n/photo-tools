@@ -106,7 +106,7 @@ class RAMTagger:
         if self._last_logits is None:
             return [(t, 0.0) for t in raw_tags]
 
-        probs = torch.sigmoid(self._last_logits).squeeze(0).cpu().numpy()
+        probs = torch.sigmoid(self._last_logits).squeeze().cpu().numpy()
         tag_list = list(self.model.tag_list)
         index = {str(name): i for i, name in enumerate(tag_list)}
 
