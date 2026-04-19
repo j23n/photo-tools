@@ -615,9 +615,11 @@ def process_single(
     if enable_ram and visual_path:
         try:
             tagger = _get_ram_tagger()
-            ram_tags, raw_ram_tags = tagger.tag_image(visual_input)
-            if raw_ram_tags:
-                log.info("  RAM++ top 5: %s", ", ".join(raw_ram_tags[:5]))
+            ram_tags, scored_ram_tags = tagger.tag_image(visual_input)
+            if scored_ram_tags:
+                log.info("  RAM++ top 5: %s",
+                         ", ".join(f"{t} ({s:.3f})"
+                                   for t, s in scored_ram_tags[:5]))
             log.debug("  RAM++: %s", ram_tags)
             all_tags.extend(ram_tags)
         except Exception as e:
