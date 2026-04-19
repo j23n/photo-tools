@@ -618,8 +618,8 @@ def process_single(
             ram_tags, scored_ram_tags = tagger.tag_image(visual_input)
             if scored_ram_tags:
                 log.info("  RAM++ top 5: %s",
-                         ", ".join(f"{t} ({s:.3f})"
-                                   for t, s in scored_ram_tags[:5]))
+                         ", ".join(f"{t} ({s:.3f}/thr {thr:.3f})"
+                                   for t, s, thr in scored_ram_tags[:5]))
             log.debug("  RAM++: %s", ram_tags)
             all_tags.extend(ram_tags)
         except Exception as e:
