@@ -560,7 +560,8 @@ def run_clear_tags(args) -> None:
 
     total = len(paths)
     if args.dry_run:
-        log.info("[DRY RUN] Would clear ALL tags from %d file(s)", total)
+        log.info("[DRY RUN] Would clear tags from %d file(s) "
+                 "(People/* and face regions preserved)", total)
         return
 
     try:
@@ -571,14 +572,8 @@ def run_clear_tags(args) -> None:
         log.info("Aborted.")
         return
 
-    log.info("Clearing ALL tags from %d file(s) ...", total)
-    batch_size = get_config().exiftool.batch_size
-    for i in range(0, total, batch_size):
-        batch = paths[i:i + batch_size]
-        print(f"\r  Clearing tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
-              end="", flush=True, file=sys.stderr)
-        clear_all_tags(batch, dry_run=False)
-    print(file=sys.stderr)
+    log.info("Clearing tags from %d file(s) (People/* and face regions preserved) ...", total)
+    clear_all_tags(paths, dry_run=False)
 
 
 def run_search_tags(args) -> None:

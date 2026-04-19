@@ -209,6 +209,43 @@ _ALL_TAG_FIELDS = (
 )
 
 
+def _read_people_tags(paths: list[Path]) -> dict[Path, list[str]]:
+    """Return digiKam People/* hierarchical tags for each file."""
+    if not paths:
+        return {}
+
+    cfg = get_config()
+    batch_size = cfg.exiftool.batch_size
+    result: dict[Path, list[str]] = {}
+
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i + batch_size]
+        try:
+            proc = subprocess.run(
+                ["exiftool", "-j", "-XMP-digiKam:TagsList"]
+                + [str(p) for p in batch],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                continue
+            meta_list = json.loads(proc.stdout)
+        except Exception:
+            continue
+
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            tags = meta.get("TagsList", [])
+            if isinstance(tags, str):
+                tags = [tags]
+            people = [str(t) for t in tags if str(t).startswith("People/")]
+            if people:
+                result[path] = people
+
+    return result
+
+
 def clear_all_tags(
     paths: list[Path],
     *,
@@ -218,8 +255,9 @@ def clear_all_tags(
 
     Removes all keyword containers listed in _ALL_TAG_FIELDS plus the entire
     XMP-phototools namespace (TaggerVersion, TaggedAt, CountryCode, CLIP
-    cache). The file is left with only the metadata that was on it before
-    photo-tools — and any sibling tool — touched it.
+    cache). digiKam-owned People/* tags are read first and rewritten after
+    the wipe so face-recognition bookkeeping survives. Face regions in
+    XMP-mwg-rs are never touched — that namespace is outside the wipe set.
     """
     if not paths:
         return True
@@ -234,8 +272,13 @@ def clear_all_tags(
     clear_args = [f"-{field}=" for field in _ALL_TAG_FIELDS]
     clear_args.append("-XMP-phototools:all=")
 
-    for i in range(0, len(paths), batch_size):
-        batch = paths[i:i + batch_size]
+    people_by_path = _read_people_tags(paths)
+    no_people = [p for p in paths if not people_by_path.get(p)]
+    with_people = [(p, people_by_path[p]) for p in paths if people_by_path.get(p)]
+
+    # Fast path: files with no People/* tags — batch-wipe.
+    for i in range(0, len(no_people), batch_size):
+        batch = no_people[i:i + batch_size]
         args = [
             "exiftool", "-config", str(_EXIFTOOL_CONFIG),
             "-overwrite_original",
@@ -250,6 +293,32 @@ def clear_all_tags(
                 success = False
         except Exception as e:
             log.warning("Error clearing tags: %s", e)
+            success = False
+
+    # Per-file path: wipe and restore People/* in a single exiftool call.
+    for path, people_tags in with_people:
+        args = [
+            "exiftool", "-config", str(_EXIFTOOL_CONFIG),
+            "-overwrite_original",
+            *clear_args,
+        ]
+        for tag in people_tags:
+            leaf = tag.rsplit("/", 1)[-1]
+            args.extend([
+                f"-IPTC:Keywords+={leaf}",
+                f"-XMP-dc:Subject+={leaf}",
+                f"-XMP-digiKam:TagsList+={tag}",
+            ])
+        args.append(str(path))
+        try:
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    timeout=cfg.exiftool.timeout)
+            if result.returncode != 0:
+                log.warning("Could not clear tags from %s: %s",
+                            path.name, result.stderr.strip())
+                success = False
+        except Exception as e:
+            log.warning("Error clearing tags from %s: %s", path.name, e)
             success = False
 
     return success
