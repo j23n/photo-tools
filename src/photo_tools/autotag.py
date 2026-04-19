@@ -615,7 +615,9 @@ def process_single(
     if enable_ram and visual_path:
         try:
             tagger = _get_ram_tagger()
-            ram_tags = tagger.tag_image(visual_input)
+            ram_tags, raw_ram_tags = tagger.tag_image(visual_input)
+            if raw_ram_tags:
+                log.info("  RAM++ top 5: %s", ", ".join(raw_ram_tags[:5]))
             log.debug("  RAM++: %s", ram_tags)
             all_tags.extend(ram_tags)
         except Exception as e:
@@ -641,7 +643,10 @@ def process_single(
             try:
                 lm_index = _get_landmark_index(landmarks_path)
                 if lm_index is not None:
-                    landmark = lm_index.lookup(embedding, lat=lat, lon=lon)
+                    landmark, lm_top = lm_index.lookup(embedding, lat=lat, lon=lon)
+                    if lm_top:
+                        log.info("  Landmarks top 3: %s",
+                                 ", ".join(f"{n} ({s:.3f})" for n, s in lm_top[:3]))
                     if landmark:
                         tag = f"Landmarks/{title(landmark)}"
                         log.debug("  Landmark: %s", tag)

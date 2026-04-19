@@ -59,8 +59,15 @@ class LandmarkIndex:
         lon: float,
         radius_km: float | None = None,
         threshold: float | None = None,
-    ) -> str | None:
-        """Find the best matching landmark for an image embedding."""
+    ) -> tuple[str | None, list[tuple[str, float]]]:
+        """Find the best matching landmark for an image embedding.
+
+        Returns (best_name_or_None, top_candidates). top_candidates is a
+        list of (name, score) sorted by score descending; empty if no
+        landmarks are within radius_km. The best match is only returned
+        when its score meets `threshold`, but top_candidates is always
+        populated when there are nearby landmarks (useful for logging).
+        """
         import faiss
 
         cfg = get_config()
@@ -80,7 +87,7 @@ class LandmarkIndex:
         if len(nearby_indices) == 0:
             log.debug("No landmarks within %.0f km of (%.4f, %.4f)",
                       radius_km, lat, lon)
-            return None
+            return None, []
 
         nearby_embeddings = self._embeddings[nearby_indices]
         dim = nearby_embeddings.shape[1]
@@ -89,12 +96,15 @@ class LandmarkIndex:
 
         k = min(5, len(nearby_indices))
         scores, local_indices = tmp_index.search(embedding, k)
+        top = [
+            (self.names[nearby_indices[local_indices[0, j]]],
+             float(scores[0, j]))
+            for j in range(k)
+        ]
         log.debug("Landmark top-%d nearby (within %.0f km): %s",
                   k, radius_km,
-                  [(self.names[nearby_indices[local_indices[0, j]]],
-                    f"{scores[0, j]:.3f}")
-                   for j in range(k)])
+                  [(n, f"{s:.3f}") for n, s in top])
         if scores[0, 0] >= threshold:
             global_idx = nearby_indices[local_indices[0, 0]]
-            return self.names[global_idx]
-        return None
+            return self.names[global_idx], top
+        return None, top

@@ -62,8 +62,12 @@ class RAMTagger:
             filename=cfg.ram.model_filename,
         ))
 
-    def tag_image(self, image_path: Path) -> list[str]:
-        """Tag an image using RAM++."""
+    def tag_image(self, image_path: Path) -> tuple[list[str], list[str]]:
+        """Tag an image using RAM++.
+
+        Returns (mapped_tags, raw_tags). raw_tags is the full RAM++
+        output, ordered by model confidence (highest first).
+        """
         import torch
         from PIL import Image as PILImage, ImageOps
         from ram import inference_ram
@@ -75,7 +79,7 @@ class RAMTagger:
             tags_en, _ = inference_ram(img_tensor, self.model)
 
         raw_tags = [t.strip() for t in tags_en.split(" | ")]
-        return self._map_tags(raw_tags)
+        return self._map_tags(raw_tags), raw_tags
 
     def _map_tags(self, raw_tags: list[str]) -> list[str]:
         """Map RAM++ tag strings to hierarchical taxonomy tags.
