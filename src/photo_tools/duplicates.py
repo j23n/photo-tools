@@ -24,6 +24,7 @@ from photo_tools.constants import IMAGE_EXTENSIONS
 from photo_tools.debug_viewer import _find_opener, _kill_viewer, _read_key, _truncate
 from photo_tools.helpers import (
     add_tags,
+    clear_all_tags,
     find_images,
     prepare_image,
     read_cached_embedding,
@@ -475,7 +476,7 @@ def bulk_delete_tags(
 
 
 def run_list_tags(args) -> None:
-    paths = find_images(args.path, args.recursive)
+    paths = find_images(args.path)
     if not paths:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)
@@ -496,7 +497,7 @@ def run_delete_tag(args) -> None:
         log.error("Provide a tag name or --pattern")
         sys.exit(1)
 
-    paths = find_images(args.path, args.recursive)
+    paths = find_images(args.path)
     if not paths:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)
@@ -534,7 +535,7 @@ def run_delete_tag(args) -> None:
 
 
 def run_rename_tag(args) -> None:
-    paths = find_images(args.path, args.recursive)
+    paths = find_images(args.path)
     if not paths:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)
@@ -551,8 +552,37 @@ def run_rename_tag(args) -> None:
     apply_tag_change(old, new, files, args.dry_run)
 
 
+def run_clear_tags(args) -> None:
+    paths = find_images(args.path)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    total = len(paths)
+    if args.dry_run:
+        log.info("[DRY RUN] Would clear ALL tags from %d file(s)", total)
+        return
+
+    try:
+        answer = input(f"Are you sure you want to remove tags from {total} photo(s)? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        log.info("Aborted.")
+        return
+
+    log.info("Clearing ALL tags from %d file(s) ...", total)
+    batch_size = get_config().exiftool.batch_size
+    for i in range(0, total, batch_size):
+        batch = paths[i:i + batch_size]
+        print(f"\r  Clearing tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
+              end="", flush=True, file=sys.stderr)
+        clear_all_tags(batch, dry_run=False)
+    print(file=sys.stderr)
+
+
 def run_search_tags(args) -> None:
-    paths = find_images(args.path, args.recursive)
+    paths = find_images(args.path)
     if not paths:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)
@@ -576,26 +606,23 @@ def run_search_tags(args) -> None:
 def build_tags_parser(subparsers) -> None:
     tags_parser = subparsers.add_parser(
         "tags",
-        help="Tag management: list, search, delete, rename.",
+        help="Tag management: list, search, delete, rename, clear.",
     )
     tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
 
     p = tags_sub.add_parser("list", help="List all tags with file counts.")
     p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("-r", "--recursive", action="store_true")
     p.set_defaults(func=run_list_tags)
 
     p = tags_sub.add_parser("search", help="List files that have a given tag.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", help="Tag to search for")
-    p.add_argument("-r", "--recursive", action="store_true")
     p.set_defaults(func=run_search_tags)
 
     p = tags_sub.add_parser("delete", help="Delete a tag (or regex pattern) from all files.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", nargs="?", help="Exact tag to delete")
     p.add_argument("-p", "--pattern", help="Regex pattern to match tags for deletion")
-    p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_delete_tag)
 
@@ -603,9 +630,16 @@ def build_tags_parser(subparsers) -> None:
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("old", help="Tag to rename")
     p.add_argument("new", help="New tag name")
-    p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_rename_tag)
+
+    p = tags_sub.add_parser(
+        "clear",
+        help="Wipe ALL tags and the photo-tools namespace, leaving only original EXIF.",
+    )
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
+    p.set_defaults(func=run_clear_tags)
 
     from photo_tools.debug_viewer import add_inspect_subparser
     add_inspect_subparser(tags_sub)
@@ -617,7 +651,6 @@ def build_similar_parser(subparsers) -> argparse.ArgumentParser:
         help="Find visually similar images using CLIP embeddings.",
     )
     sub.add_argument("path", type=Path, help="Target directory or file")
-    sub.add_argument("-r", "--recursive", action="store_true")
     sub.add_argument("-n", "--dry-run", action="store_true",
                      help="Preview moves without executing")
     sub.add_argument("--threshold", type=float, default=None,
@@ -641,7 +674,7 @@ def run_find_similar(args) -> None:
     model_id = f"{clip_model}/{clip_pretrained}"
     threshold = args.threshold if args.threshold is not None else cfg.similarity.threshold
 
-    all_files = find_images(args.path, args.recursive)
+    all_files = find_images(args.path)
     image_paths = [p for p in all_files if p.suffix.lower() in IMAGE_EXTENSIONS]
 
     if not image_paths:

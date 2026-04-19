@@ -195,6 +195,66 @@ def clear_all_keywords(path: Path, dry_run: bool = False) -> bool:
         return False
 
 
+# Fields wiped by clear_all_tags: every keyword/tag container plus the legacy
+# sibling fields that past versions (and neighbouring tools) wrote into. See
+# docs/xmp-schema.md §1.1 and §1.3.
+_ALL_TAG_FIELDS = (
+    "IPTC:Keywords",
+    "XMP-dc:Subject",
+    "XMP-digiKam:TagsList",
+    "XMP-lr:HierarchicalSubject",
+    "MicrosoftPhoto:LastKeywordXMP",
+    "MediaPro:CatalogSets",
+    "MicrosoftPhoto:CategorySet",
+)
+
+
+def clear_all_tags(
+    paths: list[Path],
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Wipe every photo-tools-owned keyword and namespace field from files.
+
+    Removes all keyword containers listed in _ALL_TAG_FIELDS plus the entire
+    XMP-phototools namespace (TaggerVersion, TaggedAt, CountryCode, CLIP
+    cache). The file is left with only the metadata that was on it before
+    photo-tools — and any sibling tool — touched it.
+    """
+    if not paths:
+        return True
+    if dry_run:
+        log.info("[DRY RUN] Would clear ALL tags from %d file(s)", len(paths))
+        return True
+
+    cfg = get_config()
+    batch_size = cfg.exiftool.batch_size
+    success = True
+
+    clear_args = [f"-{field}=" for field in _ALL_TAG_FIELDS]
+    clear_args.append("-XMP-phototools:all=")
+
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i + batch_size]
+        args = [
+            "exiftool", "-config", str(_EXIFTOOL_CONFIG),
+            "-overwrite_original",
+            *clear_args,
+            *(str(f) for f in batch),
+        ]
+        try:
+            result = subprocess.run(args, capture_output=True, text=True,
+                                    timeout=cfg.exiftool.timeout)
+            if result.returncode != 0:
+                log.warning("Could not clear tags: %s", result.stderr.strip())
+                success = False
+        except Exception as e:
+            log.warning("Error clearing tags: %s", e)
+            success = False
+
+    return success
+
+
 # ---------------------------------------------------------------------------
 # EXIF reading
 # ---------------------------------------------------------------------------
@@ -527,7 +587,7 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
 # File discovery
 # ---------------------------------------------------------------------------
 
-def find_images(target: Path, recursive: bool = False) -> list[Path]:
+def find_images(target: Path) -> list[Path]:
     if target.is_file():
         if target.suffix.lower() in SUPPORTED_EXTENSIONS:
             return [target]
@@ -538,8 +598,7 @@ def find_images(target: Path, recursive: bool = False) -> list[Path]:
         return []
 
     images = []
-    pattern = "**/*" if recursive else "*"
-    for f in target.glob(pattern):
+    for f in target.glob("**/*"):
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
             images.append(f)
 
