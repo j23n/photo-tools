@@ -16,11 +16,11 @@ SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 # Tagger version. Bump on any schema change (see docs/xmp-schema.md §6).
 # Stored in photo-tools:TaggerVersion; presence acts as the "already tagged"
 # sentinel and a mismatched value triggers automatic re-tagging.
-TAGGER_VERSION = "2026.1"
+TAGGER_VERSION = "2026.2"
 
 # Top-level taxonomy roots we own (digiKam:TagsList prefixes). People/ is
 # digiKam-owned and intentionally absent from this list.
-OUR_TAG_ROOTS = ("Places/", "Objects/", "Scenes/")
+OUR_TAG_ROOTS = ("Places/", "Landmarks/", "Objects/", "Scenes/")
 
 # OCR text tags use a separate root for tag-tree organization.
 OCR_TAG_ROOT = "Text/"

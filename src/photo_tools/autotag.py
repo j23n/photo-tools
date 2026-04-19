@@ -643,13 +643,7 @@ def process_single(
                 if lm_index is not None:
                     landmark = lm_index.lookup(embedding, lat=lat, lon=lon)
                     if landmark:
-                        # Surface landmarks under Places/ alongside reverse-
-                        # geocoded paths. The landmark name itself becomes the
-                        # leaf — e.g. "Places/Italy/Lazio/Rome/Colosseum".
-                        if places:
-                            tag = f"{places[0]}/{title(landmark)}"
-                        else:
-                            tag = f"Places/{title(landmark)}"
+                        tag = f"Landmarks/{title(landmark)}"
                         log.debug("  Landmark: %s", tag)
                         all_tags.append(tag)
             except Exception as e:
