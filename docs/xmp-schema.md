@@ -27,11 +27,12 @@ For the example photo from issue #10:
 
 ```
 dc:subject       = [Chiara, Johannes, Italy, Lazio, Rome, Municipio Roma I,
-                    Balustrade, Rail, Building, Cityscape]
+                    Colosseum, Balustrade, Rail, Building, Cityscape]
 IPTC:Keywords    = (same as dc:subject)
 digiKam:TagsList = [
     People/Chiara, People/Johannes,                  # written by digiKam, not us
     Places/Italy/Lazio/Rome/Municipio Roma I,
+    Landmarks/Colosseum,
     Objects/Balustrade, Objects/Rail,
     Scenes/Building, Scenes/Cityscape,
 ]
@@ -81,6 +82,7 @@ Top-level roots in `digiKam:TagsList`:
 ```
 People/<name>                                        ← digiKam-owned
 Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]
+Landmarks/<name>
 Objects/<thing>
 Scenes/<scene>
 ```
@@ -123,7 +125,24 @@ Scene/setting classification from RAM++. Configured in `taxonomy.py`:
 > respects only `max_tags`. Wiring the model's raw logits through to
 > per-tag scores is a follow-up — see `src/photo_tools/ram_tagger.py`.
 
-### 2.5 What's deliberately excluded
+### 2.5 Landmarks
+
+Named landmarks identified by CLIP embedding similarity against a curated
+index, gated by GPS proximity. A single flat segment — the landmark name is
+Titlecased and emitted as the leaf with no geographic nesting:
+
+```
+Landmarks/Colosseum
+Landmarks/Eiffel Tower
+```
+
+Landmarks are independent of `Places/`. A photo of the Colosseum gets both
+the reverse-geocoded Places path *and* the Landmarks tag; the former answers
+"where was this taken" and the latter answers "what is this". Landmark
+lookup requires GPS (from EXIF or an explicit fallback) and a built index;
+without either it is skipped silently.
+
+### 2.6 What's deliberately excluded
 
 These were written by older versions and are dropped:
 

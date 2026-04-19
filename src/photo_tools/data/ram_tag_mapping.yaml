@@ -268,7 +268,6 @@ bichon: {category: Objects, tag: Dog}
 bicycle: {category: Objects, tag: Bicycle}
 bicycle helmet: {category: Objects, tag: Helmet}
 bicycle wheel: {category: Objects, tag: Bicycle}
-big ben: {category: Scenes, tag: Landmark}
 bike lane: {category: Scenes, tag: Road}
 bike path: {category: Scenes, tag: Trail}
 bikini: {category: Objects, tag: Swimwear}

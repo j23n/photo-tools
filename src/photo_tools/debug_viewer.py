@@ -74,8 +74,8 @@ def _load_metadata(path: Path) -> dict:
     taken_at = _parse_exif_datetime(exif)
     keywords = get_existing_keywords(exif)
 
-    landmarks = sorted(t for t in keywords if t.startswith("landmark/"))
-    tags = sorted(t for t in keywords if not t.startswith("landmark/"))
+    landmarks = sorted(t for t in keywords if t.startswith("Landmarks/"))
+    tags = sorted(t for t in keywords if not t.startswith("Landmarks/"))
 
     return {
         "path": str(path.resolve()),
