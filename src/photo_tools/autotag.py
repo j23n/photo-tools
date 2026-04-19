@@ -645,9 +645,10 @@ def process_single(
             try:
                 lm_index = _get_landmark_index(landmarks_path)
                 if lm_index is not None:
-                    landmark, lm_top = lm_index.lookup(embedding, lat=lat, lon=lon)
+                    landmark, lm_top, lm_thr = lm_index.lookup(
+                        embedding, lat=lat, lon=lon)
                     if lm_top:
-                        log.info("  Landmarks top 3: %s",
+                        log.info("  Landmarks top 3 (thr %.3f): %s", lm_thr,
                                  ", ".join(f"{n} ({s:.3f})" for n, s in lm_top[:3]))
                     if landmark:
                         tag = f"Landmarks/{title(landmark)}"
