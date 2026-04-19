@@ -24,6 +24,7 @@ from photo_tools.constants import IMAGE_EXTENSIONS
 from photo_tools.debug_viewer import _find_opener, _kill_viewer, _read_key, _truncate
 from photo_tools.helpers import (
     add_tags,
+    clear_all_tags,
     find_images,
     prepare_image,
     read_cached_embedding,
@@ -551,6 +552,27 @@ def run_rename_tag(args) -> None:
     apply_tag_change(old, new, files, args.dry_run)
 
 
+def run_clear_tags(args) -> None:
+    paths = find_images(args.path, args.recursive)
+    if not paths:
+        log.error("No supported images found at %s", args.path)
+        sys.exit(1)
+
+    total = len(paths)
+    if args.dry_run:
+        log.info("[DRY RUN] Would clear ALL tags from %d file(s)", total)
+        return
+
+    log.info("Clearing ALL tags from %d file(s) ...", total)
+    batch_size = get_config().exiftool.batch_size
+    for i in range(0, total, batch_size):
+        batch = paths[i:i + batch_size]
+        print(f"\r  Clearing tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
+              end="", flush=True, file=sys.stderr)
+        clear_all_tags(batch, dry_run=False)
+    print(file=sys.stderr)
+
+
 def run_search_tags(args) -> None:
     paths = find_images(args.path, args.recursive)
     if not paths:
@@ -576,7 +598,7 @@ def run_search_tags(args) -> None:
 def build_tags_parser(subparsers) -> None:
     tags_parser = subparsers.add_parser(
         "tags",
-        help="Tag management: list, search, delete, rename.",
+        help="Tag management: list, search, delete, rename, clear.",
     )
     tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
 
@@ -606,6 +628,15 @@ def build_tags_parser(subparsers) -> None:
     p.add_argument("-r", "--recursive", action="store_true")
     p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_rename_tag)
+
+    p = tags_sub.add_parser(
+        "clear",
+        help="Wipe ALL tags and the photo-tools namespace, leaving only original EXIF.",
+    )
+    p.add_argument("path", type=Path, help="Target directory or file")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
+    p.set_defaults(func=run_clear_tags)
 
     from photo_tools.debug_viewer import add_inspect_subparser
     add_inspect_subparser(tags_sub)

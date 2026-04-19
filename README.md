@@ -47,6 +47,7 @@ photo-tools tags list /path/to/photos -r               # list all tags with coun
 photo-tools tags search /path/to/photos "animal/cat"    # search by pattern
 photo-tools tags delete /path/to/photos "old-tag"       # remove a tag everywhere
 photo-tools tags rename /path/to/photos "old" "new"     # rename across collection
+photo-tools tags clear /path/to/photos -r               # wipe ALL tags (leaves original EXIF)
 
 # Build landmark database from Wikidata
 photo-tools build-landmarks --test            # small test set (Rome + Bologna)
