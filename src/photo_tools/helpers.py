@@ -452,14 +452,48 @@ def _try_pillow(path: Path, tmp_path: str, max_pixels: int) -> bool:
         return False
 
 
+# EXIF Orientation (1-8) → ffmpeg filter chain to bring pixels upright.
+# See https://exiftool.org/TagNames/EXIF.html#Orientation
+_FFMPEG_ORIENT_FILTERS = {
+    1: "",
+    2: "hflip",
+    3: "hflip,vflip",
+    4: "vflip",
+    5: "transpose=0",
+    6: "transpose=1",
+    7: "transpose=3",
+    8: "transpose=2",
+}
+
+
+def _read_exif_orientation(path: Path) -> int:
+    """Return EXIF Orientation (1-8), or 1 if unknown/unreadable."""
+    try:
+        result = subprocess.run(
+            ["exiftool", "-s3", "-n", "-Orientation", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            val = result.stdout.strip()
+            if val.isdigit():
+                n = int(val)
+                if 1 <= n <= 8:
+                    return n
+    except Exception:
+        pass
+    return 1
+
+
 def _try_ffmpeg(path: Path, tmp_path: str, max_pixels: int) -> bool:
     scale_filter = (
         f"scale='if(gt(iw,ih),{max_pixels},-2)':'if(gt(iw,ih),-2,{max_pixels})'"
     )
+    orient_filter = _FFMPEG_ORIENT_FILTERS[_read_exif_orientation(path)]
+    vf = f"{orient_filter},{scale_filter}" if orient_filter else scale_filter
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(path), "-frames:v", "1",
-             "-vf", scale_filter, "-q:v", "2", tmp_path],
+            ["ffmpeg", "-y", "-noautorotate", "-i", str(path), "-frames:v", "1",
+             "-vf", vf, "-q:v", "2", tmp_path],
             capture_output=True, text=True, timeout=30,
         )
         return result.returncode == 0 and Path(tmp_path).stat().st_size > 0
@@ -472,7 +506,8 @@ def _try_magick(path: Path, tmp_path: str, max_pixels: int) -> bool:
     for cmd in ["magick", "convert"]:
         try:
             result = subprocess.run(
-                [cmd, str(path), "-resize", f"{max_pixels}x{max_pixels}>",
+                [cmd, str(path), "-auto-orient",
+                 "-resize", f"{max_pixels}x{max_pixels}>",
                  "-quality", str(cfg.image.jpeg_quality), tmp_path],
                 capture_output=True, text=True, timeout=30,
             )

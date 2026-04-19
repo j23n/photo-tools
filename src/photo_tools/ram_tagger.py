@@ -45,11 +45,19 @@ class RAMTagger:
 
         self.transform = get_transform(image_size=self.image_size)
 
+        # `inference_ram` drops the per-tag logits, so hook model.fc to
+        # capture them and recover confidence scores after inference.
+        self._last_logits = None
+        self.model.fc.register_forward_hook(self._capture_logits)
+
         with open(_MAPPING_PATH) as f:
             self._mapping = yaml.safe_load(f)
         mapped_count = sum(1 for v in self._mapping.values() if v is not None)
         log.info("RAM++ loaded: %d mapped tags, %d skipped",
                  mapped_count, len(self._mapping) - mapped_count)
+
+    def _capture_logits(self, _module, _inputs, output):
+        self._last_logits = output
 
     @staticmethod
     def _get_weights() -> Path:
@@ -62,8 +70,15 @@ class RAMTagger:
             filename=cfg.ram.model_filename,
         ))
 
-    def tag_image(self, image_path: Path) -> list[str]:
-        """Tag an image using RAM++."""
+    def tag_image(
+        self, image_path: Path,
+    ) -> tuple[list[str], list[tuple[str, float]]]:
+        """Tag an image using RAM++.
+
+        Returns (mapped_tags, scored_raw_tags). scored_raw_tags is the
+        RAM++ predicted-tag list paired with per-tag sigmoid confidence
+        in [0, 1], sorted by confidence descending.
+        """
         import torch
         from PIL import Image as PILImage, ImageOps
         from ram import inference_ram
@@ -75,7 +90,32 @@ class RAMTagger:
             tags_en, _ = inference_ram(img_tensor, self.model)
 
         raw_tags = [t.strip() for t in tags_en.split(" | ")]
-        return self._map_tags(raw_tags)
+
+        scored_tags = self._score_tags(raw_tags)
+        ordered_raw = [t for t, _ in scored_tags]
+        return self._map_tags(ordered_raw), scored_tags
+
+    def _score_tags(self, raw_tags: list[str]) -> list[tuple[str, float]]:
+        """Attach sigmoid confidences to raw_tags, sorted desc by score.
+
+        Uses logits captured from the last forward pass on `model.fc`.
+        Falls back to 0.0 for any tag not found in `model.tag_list`.
+        """
+        import torch
+
+        if self._last_logits is None:
+            return [(t, 0.0) for t in raw_tags]
+
+        probs = torch.sigmoid(self._last_logits).squeeze(0).cpu().numpy()
+        tag_list = list(self.model.tag_list)
+        index = {str(name): i for i, name in enumerate(tag_list)}
+
+        scored = []
+        for t in raw_tags:
+            i = index.get(t)
+            scored.append((t, float(probs[i]) if i is not None else 0.0))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
 
     def _map_tags(self, raw_tags: list[str]) -> list[str]:
         """Map RAM++ tag strings to hierarchical taxonomy tags.
