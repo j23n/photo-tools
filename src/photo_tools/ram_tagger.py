@@ -72,12 +72,13 @@ class RAMTagger:
 
     def tag_image(
         self, image_path: Path,
-    ) -> tuple[list[str], list[tuple[str, float]]]:
+    ) -> tuple[list[str], list[tuple[str, float, float]]]:
         """Tag an image using RAM++.
 
         Returns (mapped_tags, scored_raw_tags). scored_raw_tags is the
-        RAM++ predicted-tag list paired with per-tag sigmoid confidence
-        in [0, 1], sorted by confidence descending.
+        RAM++ predicted-tag list as (tag, score, threshold) triples —
+        sigmoid confidence and the per-tag threshold the model used to
+        decide "predicted", both in [0, 1] — sorted by score descending.
         """
         import torch
         from PIL import Image as PILImage, ImageOps
@@ -92,28 +93,35 @@ class RAMTagger:
         raw_tags = [t.strip() for t in tags_en.split(" | ")]
 
         scored_tags = self._score_tags(raw_tags)
-        ordered_raw = [t for t, _ in scored_tags]
+        ordered_raw = [t for t, _, _ in scored_tags]
         return self._map_tags(ordered_raw), scored_tags
 
-    def _score_tags(self, raw_tags: list[str]) -> list[tuple[str, float]]:
-        """Attach sigmoid confidences to raw_tags, sorted desc by score.
+    def _score_tags(
+        self, raw_tags: list[str],
+    ) -> list[tuple[str, float, float]]:
+        """Attach sigmoid confidence and per-tag threshold to raw_tags.
 
-        Uses logits captured from the last forward pass on `model.fc`.
-        Falls back to 0.0 for any tag not found in `model.tag_list`.
+        Sorted descending by score. Uses logits captured from the last
+        forward pass on `model.fc` and per-tag thresholds from
+        `model.class_threshold`. Falls back to 0.0 for any tag not found
+        in `model.tag_list`.
         """
         import torch
 
         if self._last_logits is None:
-            return [(t, 0.0) for t in raw_tags]
+            return [(t, 0.0, 0.0) for t in raw_tags]
 
         probs = torch.sigmoid(self._last_logits).squeeze().cpu().numpy()
-        tag_list = list(self.model.tag_list)
-        index = {str(name): i for i, name in enumerate(tag_list)}
+        thresholds = self.model.class_threshold.cpu().numpy()
+        index = {str(name): i for i, name in enumerate(self.model.tag_list)}
 
         scored = []
         for t in raw_tags:
             i = index.get(t)
-            scored.append((t, float(probs[i]) if i is not None else 0.0))
+            if i is None:
+                scored.append((t, 0.0, 0.0))
+            else:
+                scored.append((t, float(probs[i]), float(thresholds[i])))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 
