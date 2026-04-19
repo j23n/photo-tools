@@ -688,20 +688,20 @@ def process_single(
 # Watch mode
 # ---------------------------------------------------------------------------
 
-def watch_directory(target, recursive, dry_run,
+def watch_directory(target, dry_run,
                     enable_ram, enable_landmarks, enable_ocr,
                     clip_model=None, clip_pretrained=None, landmarks_path=None):
     log.info("Watching %s for new images (Ctrl+C to stop) ...", target)
     seen: set[Path] = set()
 
-    for img in find_images(target, recursive):
+    for img in find_images(target):
         if get_tagger_version(read_exif(img)) == TAGGER_VERSION:
             seen.add(img.resolve())
     log.info("Found %d already-tagged images, skipping those.", len(seen))
 
     while True:
         try:
-            for img in find_images(target, recursive):
+            for img in find_images(target):
                 resolved = img.resolve()
                 if resolved in seen:
                     continue
@@ -727,7 +727,6 @@ def watch_directory(target, recursive, dry_run,
 
 def _add_tag_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("path", type=Path, help="Image file or directory")
-    parser.add_argument("-r", "--recursive", action="store_true")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Preview tags without writing")
     parser.add_argument("-f", "--force", action="store_true",
@@ -791,14 +790,14 @@ def run_tag(args) -> None:
         if not args.path.is_dir():
             log.error("--watch requires a directory")
             sys.exit(1)
-        watch_directory(args.path, args.recursive, args.dry_run,
+        watch_directory(args.path, args.dry_run,
                         enable_ram, enable_landmarks, enable_ocr,
                         clip_model=args.clip_model,
                         clip_pretrained=args.clip_pretrained,
                         landmarks_path=args.landmarks_db)
         return
 
-    images = find_images(args.path, args.recursive)
+    images = find_images(args.path)
     if not images:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)

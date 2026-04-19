@@ -252,13 +252,11 @@ def add_inspect_subparser(tags_sub) -> None:
     )
     p.add_argument("path", type=Path,
                    help="Image file or directory to inspect")
-    p.add_argument("-r", "--recursive", action="store_true",
-                   help="Recurse into subdirectories")
     p.set_defaults(func=run_inspect)
 
 
 def run_inspect(args) -> None:
-    images = find_images(args.path, args.recursive)
+    images = find_images(args.path)
     if not images:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)

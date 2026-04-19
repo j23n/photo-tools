@@ -587,7 +587,7 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
 # File discovery
 # ---------------------------------------------------------------------------
 
-def find_images(target: Path, recursive: bool = False) -> list[Path]:
+def find_images(target: Path) -> list[Path]:
     if target.is_file():
         if target.suffix.lower() in SUPPORTED_EXTENSIONS:
             return [target]
@@ -598,8 +598,7 @@ def find_images(target: Path, recursive: bool = False) -> list[Path]:
         return []
 
     images = []
-    pattern = "**/*" if recursive else "*"
-    for f in target.glob(pattern):
+    for f in target.glob("**/*"):
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS:
             images.append(f)
 
