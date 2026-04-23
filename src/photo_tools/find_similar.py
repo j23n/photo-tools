@@ -26,7 +26,7 @@ from photo_tools.helpers import (
     find_images,
     open_and_rotate,
     prepare_image,
-    read_cached_embedding,
+    read_cached_embeddings_batch,
     write_embedding,
 )
 
@@ -48,19 +48,16 @@ def load_embeddings(
     """Load CLIP embeddings for all paths. Reads from XMP cache first,
     falls back to computing via CLIPEmbedder for images without cached embeddings."""
     cfg = get_config()
-    result = {}
-    missing = []
+    result: dict[Path, np.ndarray] = {}
     total = len(paths)
 
-    for i, path in enumerate(paths, 1):
-        print(f"\r  Reading embeddings {i}/{total} ...", end="", flush=True, file=sys.stderr)
-        if not force:
-            cached = read_cached_embedding(path, model_id)
-            if cached is not None:
-                result[path] = cached
-                continue
-        missing.append(path)
-    print(file=sys.stderr)
+    if force:
+        missing = list(paths)
+    else:
+        print(f"  Reading embeddings for {total} images ...",
+              file=sys.stderr, flush=True)
+        result.update(read_cached_embeddings_batch(paths, model_id))
+        missing = [p for p in paths if p not in result]
 
     if not missing:
         return result
