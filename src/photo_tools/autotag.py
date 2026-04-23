@@ -8,7 +8,6 @@ import argparse
 import json
 import logging
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -27,6 +26,8 @@ from photo_tools.constants import (
     VALID_ONSETS,
 )
 from photo_tools.helpers import (
+    _run_exiftool,
+    _run_exiftool_json,
     add_tags,
     clear_all_keywords,
     deduplicate,
@@ -137,19 +138,15 @@ def build_gps_timeline(paths: list[Path]) -> dict[Path, tuple[float, float]]:
     gps_data: list[tuple[Path, datetime | None, tuple[float, float] | None]] = []
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
-        try:
-            proc = subprocess.run(
-                ["exiftool", "-j", "-n",
-                 "-GPS:GPSLatitude", "-GPS:GPSLongitude",
-                 "-GPS:GPSLatitudeRef", "-GPS:GPSLongitudeRef",
-                 "-EXIF:DateTimeOriginal", "-EXIF:CreateDate"]
-                + [str(p) for p in batch],
-                capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode != 0:
-                continue
-            meta_list = json.loads(proc.stdout)
-        except Exception:
+        meta_list = _run_exiftool_json(
+            ["-n",
+             "-GPS:GPSLatitude", "-GPS:GPSLongitude",
+             "-GPS:GPSLatitudeRef", "-GPS:GPSLongitudeRef",
+             "-EXIF:DateTimeOriginal", "-EXIF:CreateDate"]
+            + [str(p) for p in batch],
+            with_config=False, timeout=120,
+        )
+        if not meta_list:
             continue
 
         str_to_path = {str(p): p for p in batch}
@@ -305,10 +302,12 @@ def _get_ocr_engine():
 
 def _get_image_dimensions(path) -> tuple[int | None, int | None]:
     try:
-        from PIL import Image as PILImage, ImageOps
-        with PILImage.open(str(path)) as img:
-            ImageOps.exif_transpose(img, in_place=True)
+        from photo_tools.helpers import open_and_rotate
+        img = open_and_rotate(path)
+        try:
             return img.size
+        finally:
+            img.close()
     except Exception:
         return None, None
 
@@ -397,14 +396,10 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
 def _read_existing_regions(path: Path) -> tuple[list[dict], list[dict], dict | None]:
     """Read existing MWG and IPTC regions, returning non-OCR regions to preserve."""
     try:
-        result = subprocess.run(
-            ["exiftool", "-j", "-struct",
-             "-XMP-mwg-rs:RegionInfo", "-XMP-iptcExt:ImageRegion", str(path)],
-            capture_output=True, text=True, timeout=30,
+        meta = _run_exiftool_json(
+            ["-struct", "-XMP-mwg-rs:RegionInfo", "-XMP-iptcExt:ImageRegion", str(path)],
+            with_config=False, timeout=30,
         )
-        if result.returncode != 0:
-            return [], [], None
-        meta = json.loads(result.stdout)
         if not meta:
             return [], [], None
         data = meta[0]
@@ -477,9 +472,9 @@ def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -
     try:
         json.dump([meta], tmp)
         tmp.close()
-        result = subprocess.run(
-            ["exiftool", "-overwrite_original", "-struct", f"-json={tmp.name}", str(path)],
-            capture_output=True, text=True, timeout=60,
+        result = _run_exiftool(
+            ["-overwrite_original", "-struct", f"-json={tmp.name}", str(path)],
+            with_config=False, timeout=60,
         )
         if result.returncode != 0:
             log.error("exiftool region write failed for %s: %s", path.name, result.stderr.strip())

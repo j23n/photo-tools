@@ -31,9 +31,9 @@ ALL_OUR_ROOTS = OUR_TAG_ROOTS + (OCR_TAG_ROOT,)
 # now-empty parent nodes in digiKam's tag tree).
 OUR_TAG_ROOT_NAMES = {r.rstrip("/").lower() for r in ALL_OUR_ROOTS}
 
-# Pre-2026.1 keyword prefixes / bare names. Only used by the migration paths
-# (scripts/migrate_xmp.sh and drop_digikam_tags) to clean up files written by
-# older versions. Do not extend this for new functionality.
+# Legacy keyword prefixes / bare names from older versions, retained so
+# `drop-digikam-tags` can recognize and remove them from existing DigiKam
+# databases. Do not extend this for new functionality.
 LEGACY_PREFIXES = (
     "country/", "cc/", "region/", "city/", "neighborhood/",
     "landmark/", "scene/", "setting/",

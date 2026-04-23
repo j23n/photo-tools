@@ -1,7 +1,6 @@
 """Shared helpers for photo-tools.
 
 Exiftool operations, file discovery, image preparation, and embedding cache.
-Extracted from autotag.py to be shared by duplicates.py and other modules.
 """
 
 import base64
@@ -29,6 +28,48 @@ log = logging.getLogger("helpers")
 # Path to our exiftool config registering the photo-tools XMP namespace.
 # See docs/xmp-schema.md §1.2 and exiftool_phototools.config.
 _EXIFTOOL_CONFIG = Path(__file__).with_name("exiftool_phototools.config")
+
+
+# ---------------------------------------------------------------------------
+# Exiftool subprocess helpers
+# ---------------------------------------------------------------------------
+
+def _run_exiftool(
+    args: list[str],
+    *,
+    with_config: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Invoke exiftool with consistent capture/timeout handling.
+
+    `with_config` prepends `-config <photo-tools.config>` so the
+    XMP-phototools namespace is recognized; pass `False` for calls that
+    only touch standard tags. `timeout` defaults to
+    `exiftool.timeout` from the config.
+    """
+    if timeout is None:
+        timeout = get_config().exiftool.timeout
+    cmd = ["exiftool"]
+    if with_config:
+        cmd += ["-config", str(_EXIFTOOL_CONFIG)]
+    cmd += args
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _run_exiftool_json(
+    args: list[str],
+    *,
+    with_config: bool = True,
+    timeout: float | None = None,
+) -> list[dict]:
+    """Run exiftool with `-j` and return parsed JSON, or [] on failure."""
+    proc = _run_exiftool(["-j"] + args, with_config=with_config, timeout=timeout)
+    if proc.returncode != 0:
+        return []
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +140,7 @@ def add_tags(
         return True
 
     ts = datetime.now(timezone.utc).isoformat()
-    args = ["exiftool", "-config", str(_EXIFTOOL_CONFIG), "-overwrite_original"]
+    args = ["-overwrite_original"]
     for kw in keywords:
         args.extend(_build_tag_args(kw, "+="))
     args.extend([
@@ -110,10 +151,8 @@ def add_tags(
         args.append(f"-XMP-phototools:{field}={value}")
     args.append(str(path))
 
-    cfg = get_config()
     try:
-        result = subprocess.run(args, capture_output=True, text=True,
-                                timeout=cfg.exiftool.timeout)
+        result = _run_exiftool(args)
         if result.returncode != 0:
             log.error("exiftool failed for %s: %s", path.name, result.stderr.strip())
             return False
@@ -145,20 +184,18 @@ def remove_tags(
         log.info("[DRY RUN] Would remove %d tag(s) from %d file(s)", len(tags), len(paths))
         return True
 
-    cfg = get_config()
-    batch_size = cfg.exiftool.batch_size
+    batch_size = get_config().exiftool.batch_size
     success = True
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
-        args = ["exiftool", "-overwrite_original"]
+        args = ["-overwrite_original"]
         for tag in tags:
             args.extend(_build_tag_args(tag, "-="))
         args.extend(str(f) for f in batch)
 
         try:
-            result = subprocess.run(args, capture_output=True, text=True,
-                                    timeout=cfg.exiftool.timeout)
+            result = _run_exiftool(args, with_config=False)
             if result.returncode != 0:
                 log.warning("Could not remove tags: %s", result.stderr.strip())
                 success = False
@@ -176,15 +213,13 @@ def clear_all_keywords(path: Path, dry_run: bool = False) -> bool:
         return True
 
     args = [
-        "exiftool", "-overwrite_original",
+        "-overwrite_original",
         "-IPTC:Keywords=", "-XMP-dc:Subject=",
         "-XMP-digiKam:TagsList=",
         str(path),
     ]
-    cfg = get_config()
     try:
-        result = subprocess.run(args, capture_output=True, text=True,
-                                timeout=cfg.exiftool.timeout)
+        result = _run_exiftool(args, with_config=False)
         if result.returncode != 0:
             log.warning("Could not clear keywords from %s: %s", path.name, result.stderr.strip())
             return False
@@ -214,22 +249,16 @@ def _read_people_tags(paths: list[Path]) -> dict[Path, list[str]]:
     if not paths:
         return {}
 
-    cfg = get_config()
-    batch_size = cfg.exiftool.batch_size
+    batch_size = get_config().exiftool.batch_size
     result: dict[Path, list[str]] = {}
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
-        try:
-            proc = subprocess.run(
-                ["exiftool", "-j", "-XMP-digiKam:TagsList"]
-                + [str(p) for p in batch],
-                capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode != 0:
-                continue
-            meta_list = json.loads(proc.stdout)
-        except Exception:
+        meta_list = _run_exiftool_json(
+            ["-XMP-digiKam:TagsList"] + [str(p) for p in batch],
+            with_config=False, timeout=120,
+        )
+        if not meta_list:
             continue
 
         str_to_path = {str(p): p for p in batch}
@@ -265,8 +294,7 @@ def clear_all_tags(
         log.info("[DRY RUN] Would clear ALL tags from %d file(s)", len(paths))
         return True
 
-    cfg = get_config()
-    batch_size = cfg.exiftool.batch_size
+    batch_size = get_config().exiftool.batch_size
     success = True
 
     clear_args = [f"-{field}=" for field in _ALL_TAG_FIELDS]
@@ -279,15 +307,9 @@ def clear_all_tags(
     # Fast path: files with no People/* tags — batch-wipe.
     for i in range(0, len(no_people), batch_size):
         batch = no_people[i:i + batch_size]
-        args = [
-            "exiftool", "-config", str(_EXIFTOOL_CONFIG),
-            "-overwrite_original",
-            *clear_args,
-            *(str(f) for f in batch),
-        ]
+        args = ["-overwrite_original", *clear_args, *(str(f) for f in batch)]
         try:
-            result = subprocess.run(args, capture_output=True, text=True,
-                                    timeout=cfg.exiftool.timeout)
+            result = _run_exiftool(args)
             if result.returncode != 0:
                 log.warning("Could not clear tags: %s", result.stderr.strip())
                 success = False
@@ -297,11 +319,7 @@ def clear_all_tags(
 
     # Per-file path: wipe and restore People/* in a single exiftool call.
     for path, people_tags in with_people:
-        args = [
-            "exiftool", "-config", str(_EXIFTOOL_CONFIG),
-            "-overwrite_original",
-            *clear_args,
-        ]
+        args = ["-overwrite_original", *clear_args]
         for tag in people_tags:
             leaf = tag.rsplit("/", 1)[-1]
             args.extend([
@@ -311,8 +329,7 @@ def clear_all_tags(
             ])
         args.append(str(path))
         try:
-            result = subprocess.run(args, capture_output=True, text=True,
-                                    timeout=cfg.exiftool.timeout)
+            result = _run_exiftool(args)
             if result.returncode != 0:
                 log.warning("Could not clear tags from %s: %s",
                             path.name, result.stderr.strip())
@@ -330,7 +347,6 @@ def clear_all_tags(
 
 def read_exif(path: Path) -> dict:
     fields = [
-        "-j",
         "-GPS:GPSLatitude", "-GPS:GPSLongitude",
         "-GPS:GPSLatitudeRef", "-GPS:GPSLongitudeRef",
         "-EXIF:Make", "-EXIF:Model",
@@ -342,13 +358,7 @@ def read_exif(path: Path) -> dict:
         "-n",
     ]
     try:
-        result = subprocess.run(
-            ["exiftool", "-config", str(_EXIFTOOL_CONFIG)] + fields + [str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            return {}
-        meta = json.loads(result.stdout)
+        meta = _run_exiftool_json(fields + [str(path)], timeout=30)
         return meta[0] if meta else {}
     except Exception as e:
         log.warning("Could not read EXIF from %s: %s", path, e)
@@ -383,25 +393,17 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
     if not paths:
         return {}
 
-    cfg = get_config()
-    batch_size = cfg.exiftool.batch_size
+    batch_size = get_config().exiftool.batch_size
     result: dict[Path, set[str]] = {}
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
-        try:
-            proc = subprocess.run(
-                ["exiftool", "-j", "-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList"]
-                + [str(p) for p in batch],
-                capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode != 0:
-                for p in batch:
-                    exif = read_exif(p)
-                    result[p] = get_existing_keywords(exif)
-                continue
-            meta_list = json.loads(proc.stdout)
-        except Exception:
+        meta_list = _run_exiftool_json(
+            ["-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList"]
+            + [str(p) for p in batch],
+            with_config=False, timeout=120,
+        )
+        if not meta_list:
             for p in batch:
                 exif = read_exif(p)
                 result[p] = get_existing_keywords(exif)
@@ -434,6 +436,20 @@ except ImportError:
     _HAVE_PILLOW = False
 
 
+def open_and_rotate(path: Path):
+    """Open an image and apply EXIF orientation.
+
+    Returns a fully-loaded PIL Image with the original file handle
+    released. Caller is responsible for any further mode conversion
+    (`.convert("RGB")`) or close().
+    """
+    img = PILImage.open(str(path))
+    rotated = ImageOps.exif_transpose(img)
+    rotated.load()
+    img.close()
+    return rotated
+
+
 def _try_pillow(path: Path, tmp_path: str, max_pixels: int) -> bool:
     if not _HAVE_PILLOW:
         return False
@@ -441,8 +457,7 @@ def _try_pillow(path: Path, tmp_path: str, max_pixels: int) -> bool:
         return False
     try:
         cfg = get_config()
-        img = PILImage.open(str(path))
-        ImageOps.exif_transpose(img, in_place=True)
+        img = open_and_rotate(path)
         img.thumbnail((max_pixels, max_pixels), PILImage.LANCZOS)
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
@@ -469,9 +484,9 @@ _FFMPEG_ORIENT_FILTERS = {
 def _read_exif_orientation(path: Path) -> int:
     """Return EXIF Orientation (1-8), or 1 if unknown/unreadable."""
     try:
-        result = subprocess.run(
-            ["exiftool", "-s3", "-n", "-Orientation", str(path)],
-            capture_output=True, text=True, timeout=10,
+        result = _run_exiftool(
+            ["-s3", "-n", "-Orientation", str(path)],
+            with_config=False, timeout=10,
         )
         if result.returncode == 0:
             val = result.stdout.strip()
@@ -640,19 +655,10 @@ def extract_video_frame(path: Path) -> Path | None:
 
 
 def read_clip_cache(path: Path) -> dict:
-    result = subprocess.run(
-        ["exiftool", "-config", str(_EXIFTOOL_CONFIG), "-j",
-         "-XMP-phototools:CLIPEmbedding",
-         "-XMP-phototools:CLIPModel",
-         str(path)],
-        capture_output=True, text=True, timeout=30,
+    meta = _run_exiftool_json(
+        ["-XMP-phototools:CLIPEmbedding", "-XMP-phototools:CLIPModel", str(path)],
+        timeout=30,
     )
-    if result.returncode != 0:
-        return {}
-    try:
-        meta = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {}
     return meta[0] if meta else {}
 
 
@@ -674,14 +680,12 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
     if dry_run:
         log.info("[DRY RUN] Would cache embedding for %s", path.name)
         return
-    cfg = get_config()
-    result = subprocess.run(
-        ["exiftool", "-config", str(_EXIFTOOL_CONFIG), "-overwrite_original",
-         f"-XMP-phototools:CLIPEmbedding={b64}",
-         f"-XMP-phototools:CLIPModel={model}",
-         str(path)],
-        capture_output=True, text=True, timeout=cfg.exiftool.timeout,
-    )
+    result = _run_exiftool([
+        "-overwrite_original",
+        f"-XMP-phototools:CLIPEmbedding={b64}",
+        f"-XMP-phototools:CLIPModel={model}",
+        str(path),
+    ])
     if result.returncode != 0:
         log.warning("Failed to cache embedding for %s: %s",
                     path.name, result.stderr.strip())

@@ -1,18 +1,15 @@
 # photo-tools XMP / IPTC schema
 
-This document defines the metadata fields photo-tools writes to image files,
-the taxonomy used for keyword tags, and the conventions consumers should rely
-on. It is the source of truth — code in `src/photo_tools/` implements this
-spec, and the migration script in `scripts/` removes anything that doesn't
-conform.
+This document describes the XMP/IPTC metadata photo-tools reads and
+writes, the taxonomy it uses for keyword tags, and the conventions
+consumers can rely on.
 
 ---
 
 ## 1. Output fields
 
-photo-tools writes exactly **two keyword/tag fields** plus a small custom XMP
-namespace for tool-private metadata. Everything else listed under "Fields we
-do not write" must remain absent (the migration script strips them).
+photo-tools writes exactly **two keyword/tag fields** plus a small custom
+XMP namespace for tool-private metadata.
 
 ### 1.1 Keyword/tag fields
 
@@ -23,7 +20,7 @@ do not write" must remain absent (the migration script strips them).
 
 Both fields use **Titlecase** for every path segment (see §3).
 
-For the example photo from issue #10:
+For example:
 
 ```
 dc:subject       = [Chiara, Johannes, Italy, Lazio, Rome, Municipio Roma I,
@@ -47,18 +44,17 @@ Namespace URI: **`https://github.com/j23n/photo-tools/ns/1.0/`**
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `photo-tools:TaggerVersion` | string (`"YYYY.N"`) | Sentinel — presence means file was tagged by this tool. Older versions trigger re-tag on next run. |
+| `photo-tools:TaggerVersion` | string (`"YYYY.N"`) | Sentinel — presence means file was tagged by this tool. A mismatched value triggers re-tag on next run. |
 | `photo-tools:TaggedAt` | ISO 8601 timestamp | When the file was last tagged. |
 | `photo-tools:CountryCode` | ISO 3166-1 alpha-2 (uppercase, e.g. `IT`) | Country code from reverse geocoding. Kept out of the keyword space. |
 | `photo-tools:CLIPEmbedding` | base64 of float32 vector | Cached image embedding for similarity search. |
 | `photo-tools:CLIPModel` | string (e.g. `ViT-B-32/laion2b_s34b_b79k`) | Model identifier for the cached embedding. |
 
-### 1.3 Fields we do not write
+### 1.3 Fields photo-tools does not write
 
-These were emitted by older versions or by other tools and are deliberately
-absent from output. The migration script removes them on existing files:
+These fields are deliberately absent from output:
 
-- `XMP-lr:HierarchicalSubject` — redundant with `digiKam:TagsList`; we don't mirror it.
+- `XMP-lr:HierarchicalSubject` — redundant with `digiKam:TagsList`.
 - `MicrosoftPhoto:LastKeywordXMP`
 - `MediaPro:CatalogSets`
 - `MicrosoftPhoto:CategorySet`
@@ -70,8 +66,6 @@ absent from output. The migration script removes them on existing files:
 - If the stored version differs from the current `TaggerVersion`, the file is
   re-tagged automatically.
 - `--force` re-tags regardless. `--clear-all` wipes everything first.
-- The legacy `ai:tagged` keyword sentinel is no longer written. The migration
-  script removes it from existing files.
 
 ---
 
@@ -85,12 +79,13 @@ Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]
 Landmarks/<name>
 Objects/<thing>
 Scenes/<scene>
+Text/<phrase>
 ```
 
 ### 2.1 People
 
 `People/*` is **owned by digiKam face recognition**. photo-tools never writes
-or removes anything under this root. Migration leaves `People/*` untouched.
+or removes anything under this root.
 
 ### 2.2 Places
 
@@ -111,19 +106,18 @@ The country code is written separately to `photo-tools:CountryCode` (see
 Concrete things detected by RAM++. Configured in `taxonomy.py`:
 
 - `max_tags`: 5
-- `min_confidence`: 0.6 *(plumbed; not yet enforced — see note below)*
+- `min_confidence`: 0.6
 
 ### 2.4 Scenes
 
 Scene/setting classification from RAM++. Configured in `taxonomy.py`:
 
 - `max_tags`: 3
-- `min_confidence`: 0.4 *(plumbed; not yet enforced — see note below)*
+- `min_confidence`: 0.4
 
-> **Note on confidence enforcement.** `inference_ram` returns predicted tag
-> names without per-tag scores, so the current `RAMTagger._map_tags`
-> respects only `max_tags`. Wiring the model's raw logits through to
-> per-tag scores is a follow-up — see `src/photo_tools/ram_tagger.py`.
+Per-category `max_tags` and `min_confidence` are enforced against
+RAM++ sigmoid scores: tags scoring below `min_confidence` are dropped
+before `max_tags` is applied.
 
 ### 2.5 Landmarks
 
@@ -142,20 +136,19 @@ the reverse-geocoded Places path *and* the Landmarks tag; the former answers
 lookup requires GPS (from EXIF or an explicit fallback) and a built index;
 without either it is skipped silently.
 
-### 2.6 What's deliberately excluded
+### 2.6 Text
 
-These were written by older versions and are dropped:
+Visible text detected by PaddleOCR. Each accepted phrase becomes a single
+flat segment:
 
-- **Date tags** (`Year/*`, `Month/*`, `Weekday/*`, `Weekend`, `DayOfMonth/*`).
-  EXIF `DateTimeOriginal` is the canonical source; consumers derive year/month
-  themselves.
-- **`Other/*` umbrella** (including `other/people`). The "is there a person"
-  signal duplicates digiKam face regions and pollutes search.
-- **`flash/fired`**. Already in EXIF.
-- **`screenshot`**. Heuristic was unreliable.
-- **`cc/<code>`**. Replaced by `photo-tools:CountryCode` in the namespace.
-- **Per-category `Activity/*`, `Event/*`, `Weather/*`, `Time/*`**. Folded into
-  Objects/Scenes where they made sense; otherwise dropped.
+```
+Text/Pizza
+Text/Caffè Centrale
+```
+
+OCR also writes IPTC `ImageRegion` entries for each detected phrase so
+consumers can locate the text in the image. Confidence and length filters
+are configured under `ocr.*` in `default_config.yaml`.
 
 ---
 
@@ -175,43 +168,16 @@ numerals, and acronyms out of the box.
 
 ---
 
-## 4. Migration
-
-Existing files written by older versions of photo-tools must be cleaned up
-once before re-tagging. `scripts/migrate_xmp.py` does this in two
-stages:
-
-1. **Strip** the legacy `photo-tools` XMP namespace contents (any URI),
-   `lr:HierarchicalSubject`, `MicrosoftPhoto:LastKeywordXMP`,
-   `MediaPro:CatalogSets`, `MicrosoftPhoto:CategorySet`, and any keyword
-   matching the legacy patterns:
-
-   ```
-   year/*, month/*, day/*, weekday, weekend, screenshot, flash/*,
-   country/*, cc/*, region/*, city/*, neighborhood/*,
-   object/*, scene/*, other/*, animal/*, food/*, plant/*, vehicle/*,
-   activity/*, event/*, weather/*, time/*, setting/*, text/*,
-   ai:tagged
-   ```
-
-2. **Re-run** `photo-tools tag` over the same files. Without the
-   `photo-tools:TaggerVersion` sentinel, every file is treated as new and
-   tagged from scratch under the new schema.
-
-The migration is one-shot and idempotent. Re-tagging is acceptable cost since
-this project is pre-alpha.
-
----
-
-## 5. Interop notes
+## 4. Interop notes
 
 - **MWG / Lightroom / digiKam** all read leaf names from `dc:subject`. Keeping
   it leaf-only matches the convention.
 - **digiKam** writes `People/*` itself (face recognition) and reads/writes
   `digiKam:TagsList` for hierarchy. Round-trip is clean.
 - **Lightroom** writes hierarchy to `lr:HierarchicalSubject` (`|` separator).
-  We do not mirror to it; users who want Lightroom-side hierarchy can run
-  exiftool to copy `digiKam:TagsList` → `lr:HierarchicalSubject` themselves.
+  photo-tools does not mirror to it; users who want Lightroom-side hierarchy
+  can run exiftool to copy `digiKam:TagsList` → `lr:HierarchicalSubject`
+  themselves.
 - **photo-tools custom namespace** is registered in
   `src/photo_tools/exiftool_phototools.config`. exiftool needs `-config
   exiftool_phototools.config` to read/write the namespace fields by name; the
@@ -219,9 +185,9 @@ this project is pre-alpha.
 
 ---
 
-## 6. Versioning
+## 5. Versioning
 
-`TaggerVersion` follows `YYYY.N` (e.g. `2026.1`). Bump `N` when:
+`TaggerVersion` follows `YYYY.N` (e.g. `2026.2`). Bump `N` when:
 
 - Any field in §1 is added, removed, or repurposed.
 - Taxonomy roots in §2 change shape.

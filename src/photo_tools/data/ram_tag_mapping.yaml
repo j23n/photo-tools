@@ -5,9 +5,6 @@
 #   - ~ (null)  → ignore this RAM++ tag
 #
 # Mapped entries first (alphabetical), then unmapped entries.
-# Curation is inherited from the original ram_tag_mapping.json — this
-# file did not re-evaluate the RAM++ vocabulary, only collapsed old
-# categories into Objects/Scenes and Titlecased the leaves.
 
 American shorthair: {category: Objects, tag: Cat}
 Border collie: {category: Objects, tag: Dog}
