@@ -654,25 +654,58 @@ def extract_video_frame(path: Path) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
-def read_clip_cache(path: Path) -> dict:
-    meta = _run_exiftool_json(
-        ["-XMP-phototools:CLIPEmbedding", "-XMP-phototools:CLIPModel", str(path)],
-        timeout=30,
-    )
-    return meta[0] if meta else {}
+def read_cached_embeddings_batch(
+    paths: list[Path], model: str
+) -> dict[Path, np.ndarray]:
+    """Read CLIP embeddings for many files in batched exiftool calls.
 
+    Only returns entries whose CLIPModel matches `model`; files with no
+    cached embedding, wrong model, or decode errors are silently omitted
+    (callers treat them as cache misses and fall back to computing).
+    """
+    if not paths:
+        return {}
 
-def read_cached_embedding(path: Path, model: str) -> np.ndarray | None:
-    cache = read_clip_cache(path)
-    if cache.get("CLIPModel") != model:
-        return None
-    b64 = cache.get("CLIPEmbedding", "")
-    if not b64:
-        return None
-    try:
-        return np.frombuffer(base64.b64decode(b64), dtype=np.float32).copy()
-    except Exception:
-        return None
+    batch_size = get_config().exiftool.batch_size
+    total = len(paths)
+    n_batches = (total + batch_size - 1) // batch_size
+    result: dict[Path, np.ndarray] = {}
+
+    for batch_idx, i in enumerate(range(0, total, batch_size), 1):
+        batch = paths[i:i + batch_size]
+        log.info("Reading embedding batch %d/%d (%d files, %d/%d total)",
+                 batch_idx, n_batches, len(batch),
+                 min(i + len(batch), total), total)
+        meta_list = _run_exiftool_json(
+            ["-XMP-phototools:CLIPEmbedding",
+             "-XMP-phototools:CLIPModel"]
+            + [str(p) for p in batch],
+            timeout=120,
+        )
+        if not meta_list:
+            continue
+
+        str_to_path = {str(p): p for p in batch}
+        hits = 0
+        for meta in meta_list:
+            if meta.get("CLIPModel") != model:
+                continue
+            b64 = meta.get("CLIPEmbedding", "")
+            if not b64:
+                continue
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            try:
+                result[path] = np.frombuffer(
+                    base64.b64decode(b64), dtype=np.float32
+                ).copy()
+                hits += 1
+            except Exception:
+                continue
+        log.debug("Batch %d/%d: %d/%d cache hits",
+                  batch_idx, n_batches, hits, len(batch))
+
+    return result
 
 
 def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> None:
