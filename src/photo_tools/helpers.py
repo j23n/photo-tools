@@ -667,10 +667,15 @@ def read_cached_embeddings_batch(
         return {}
 
     batch_size = get_config().exiftool.batch_size
+    total = len(paths)
+    n_batches = (total + batch_size - 1) // batch_size
     result: dict[Path, np.ndarray] = {}
 
-    for i in range(0, len(paths), batch_size):
+    for batch_idx, i in enumerate(range(0, total, batch_size), 1):
         batch = paths[i:i + batch_size]
+        log.info("Reading embedding batch %d/%d (%d files, %d/%d total)",
+                 batch_idx, n_batches, len(batch),
+                 min(i + len(batch), total), total)
         meta_list = _run_exiftool_json(
             ["-XMP-phototools:CLIPEmbedding",
              "-XMP-phototools:CLIPModel"]
@@ -681,6 +686,7 @@ def read_cached_embeddings_batch(
             continue
 
         str_to_path = {str(p): p for p in batch}
+        hits = 0
         for meta in meta_list:
             if meta.get("CLIPModel") != model:
                 continue
@@ -693,8 +699,11 @@ def read_cached_embeddings_batch(
                 result[path] = np.frombuffer(
                     base64.b64decode(b64), dtype=np.float32
                 ).copy()
+                hits += 1
             except Exception:
                 continue
+        log.debug("Batch %d/%d: %d/%d cache hits",
+                  batch_idx, n_batches, hits, len(batch))
 
     return result
 

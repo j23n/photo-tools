@@ -54,10 +54,9 @@ def load_embeddings(
     if force:
         missing = list(paths)
     else:
-        print(f"  Reading embeddings for {total} images ...",
-              file=sys.stderr, flush=True)
         result.update(read_cached_embeddings_batch(paths, model_id))
         missing = [p for p in paths if p not in result]
+        log.info("Loaded %d/%d embeddings from cache", len(result), total)
 
     if not missing:
         return result
