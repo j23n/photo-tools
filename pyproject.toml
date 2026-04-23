@@ -18,12 +18,16 @@ dependencies = [
     "faiss-cpu>=1.7.0",
     "paddleocr>=3.4.0",
     "paddlepaddle>=3.3.0",
-    "ruff>=0.15.9",
     "scipy",
     "timm==0.4.12",
     "fairscale==0.4.4",
     "Pillow",
     "titlecase>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.9",
 ]
 
 [build-system]

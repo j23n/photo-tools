@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from photo_tools.config import get_config
-from photo_tools.taxonomy import get_max_tags
+from photo_tools.taxonomy import CATEGORY_CONFIG
 
 log = logging.getLogger("ram_tagger")
 
@@ -81,10 +81,11 @@ class RAMTagger:
         decide "predicted", both in [0, 1] — sorted by score descending.
         """
         import torch
-        from PIL import Image as PILImage, ImageOps
         from ram import inference_ram
 
-        img = ImageOps.exif_transpose(PILImage.open(str(image_path))).convert("RGB")
+        from photo_tools.helpers import open_and_rotate
+
+        img = open_and_rotate(image_path).convert("RGB")
         img_tensor = self.transform(img).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -93,8 +94,7 @@ class RAMTagger:
         raw_tags = [t.strip() for t in tags_en.split(" | ")]
 
         scored_tags = self._score_tags(raw_tags)
-        ordered_raw = [t for t, _, _ in scored_tags]
-        return self._map_tags(ordered_raw), scored_tags
+        return self._map_tags(scored_tags), scored_tags
 
     def _score_tags(
         self, raw_tags: list[str],
@@ -125,35 +125,38 @@ class RAMTagger:
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 
-    def _map_tags(self, raw_tags: list[str]) -> list[str]:
-        """Map RAM++ tag strings to hierarchical taxonomy tags.
+    def _map_tags(
+        self, scored_tags: list[tuple[str, float, float]],
+    ) -> list[str]:
+        """Map scored RAM++ tags to hierarchical taxonomy tags.
 
         Output is `<Category>/<Tag>` (Titlecase, see docs/xmp-schema.md §2).
-        Per-category `max_tags` is enforced. Per-category `min_confidence`
-        from taxonomy.py is *not* yet enforced — `inference_ram` returns
-        only tag names, not scores. Wiring score extraction is a follow-up.
+        Per-category `max_tags` and `min_confidence` from
+        `taxonomy.CATEGORY_CONFIG` are enforced against the RAM++ sigmoid
+        scores: tags with `score < min_confidence` are dropped before
+        applying `max_tags`. Inputs are assumed to be sorted by score
+        descending (see `_score_tags`).
         """
-        by_category: dict[str, list[tuple[str, int]]] = defaultdict(list)
-        for i, raw in enumerate(raw_tags):
+        by_category: dict[str, list[str]] = defaultdict(list)
+        for raw, _score, _threshold in scored_tags:
             entry = self._mapping.get(raw)
             if entry is None:
                 continue
-            cat = entry["category"]
-            tag = entry["tag"]
-            by_category[cat].append((tag, i))
+            cfg = CATEGORY_CONFIG.get(entry["category"])
+            if cfg is None or _score < cfg["min_confidence"]:
+                continue
+            by_category[entry["category"]].append(entry["tag"])
 
         result = []
-        for cat, tags_with_pos in by_category.items():
-            max_tags = get_max_tags(cat)
-            seen = set()
-            count = 0
-            for tag, _ in sorted(tags_with_pos, key=lambda x: x[1]):
+        for cat, tags in by_category.items():
+            max_tags = CATEGORY_CONFIG[cat]["max_tags"]
+            seen: set[str] = set()
+            for tag in tags:
                 if tag in seen:
                     continue
                 seen.add(tag)
                 result.append(f"{cat}/{tag}")
-                count += 1
-                if count >= max_tags:
+                if len(seen) >= max_tags:
                     break
 
         return result

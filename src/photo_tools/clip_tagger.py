@@ -40,9 +40,10 @@ class CLIPEmbedder:
     def embed_image(self, image_path: Path) -> np.ndarray:
         """Encode an image, return L2-normalized embedding vector."""
         import torch
-        from PIL import Image as PILImage, ImageOps
 
-        img = ImageOps.exif_transpose(PILImage.open(str(image_path))).convert("RGB")
+        from photo_tools.helpers import open_and_rotate
+
+        img = open_and_rotate(image_path).convert("RGB")
         img_tensor = self.preprocess(img).unsqueeze(0)
         with torch.no_grad():
             image_features = self.model.encode_image(img_tensor)

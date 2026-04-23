@@ -1,9 +1,9 @@
 """
-duplicates.py — Similar-image detection and tag management for photo-tools.
+find_similar.py — Similar-image detection with an interactive dedup session.
 
-Subcommands:
-    find-similar Find visually similar images using CLIP embeddings cached in XMP
-    tags         Tag management: list, search, delete, rename
+Wires the `find-similar` CLI subcommand: load CLIP embeddings (cached in
+XMP, fall back to computing), cluster by cosine similarity, then offer a
+terminal UI for reviewing each cluster and moving non-kept images aside.
 """
 
 import argparse
@@ -23,17 +23,14 @@ from photo_tools.config import get_config
 from photo_tools.constants import IMAGE_EXTENSIONS
 from photo_tools.debug_viewer import _find_opener, _kill_viewer, _read_key, _truncate
 from photo_tools.helpers import (
-    add_tags,
-    clear_all_tags,
     find_images,
+    open_and_rotate,
     prepare_image,
     read_cached_embedding,
-    read_keywords_batch,
-    remove_tags,
     write_embedding,
 )
 
-log = logging.getLogger("duplicates")
+log = logging.getLogger("find_similar")
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +93,7 @@ def load_embeddings(
 
 
 # ---------------------------------------------------------------------------
-# find-similar helpers
+# Clustering
 # ---------------------------------------------------------------------------
 
 def cluster_similar(
@@ -164,9 +161,13 @@ def move_to_dest(path: Path, dest_root: Path) -> None:
     log.info("Moved %s -> %s", path.name, dest)
 
 
+# ---------------------------------------------------------------------------
+# Interactive cluster UI
+# ---------------------------------------------------------------------------
+
 def _create_contact_sheet(paths: list[Path], thumb_size: int = 200) -> Path:
     """Create a numbered thumbnail grid and return the path to a temp JPEG."""
-    from PIL import Image as PILImage, ImageDraw, ImageFont, ImageOps
+    from PIL import Image as PILImage, ImageDraw, ImageFont
 
     n = len(paths)
     cols = min(n, math.ceil(math.sqrt(n)))
@@ -195,21 +196,17 @@ def _create_contact_sheet(paths: list[Path], thumb_size: int = 200) -> Path:
         y0 = row * (cell_h + label_h)
 
         try:
-            img = PILImage.open(str(path))
-            ImageOps.exif_transpose(img, in_place=True)
+            img = open_and_rotate(path)
             img.thumbnail((cell_w - 4, cell_h - 4), PILImage.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            # Centre the thumbnail in the cell
             ox = x0 + (cell_w - img.width) // 2
             oy = y0 + (cell_h - img.height) // 2
             sheet.paste(img, (ox, oy))
         except Exception:
-            # Draw a placeholder
             draw.rectangle([x0 + 2, y0 + 2, x0 + cell_w - 2, y0 + cell_h - 2],
                            outline=(100, 100, 100))
 
-        # Number label below thumbnail
         label = str(idx)
         lx = x0 + cell_w // 2
         ly = y0 + cell_h + 2
@@ -247,7 +244,7 @@ def _print_cluster_ui(
         size_mb = path.stat().st_size / 1_048_576
         mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         marker = "KEEP" if keep[j] else "MOVE"
-        pointer = "\u25b6" if j == cursor else " "
+        pointer = "▶" if j == cursor else " "
         if j == 0:
             sim_str = "       "
         else:
@@ -261,8 +258,8 @@ def _print_cluster_ui(
         lines.append("  Zoomed on image — press any key to return to overview")
     else:
         lines += [
-            "  [\u2191\u2193] select  [space] toggle  [a] keep all  [d] keep first only",
-            "  [\u2190\u2192] prev/next cluster  [enter] confirm & next  [z] zoom  [q] quit",
+            "  [↑↓] select  [space] toggle  [a] keep all  [d] keep first only",
+            "  [←→] prev/next cluster  [enter] confirm & next  [z] zoom  [q] quit",
         ]
 
     sys.stdout.write("\x1b[2J\x1b[H")
@@ -321,7 +318,6 @@ def interactive_similar_session(
             cursor = 0
             zoomed = False
 
-            # Generate and show contact sheet
             if sheet_path:
                 try:
                     os.unlink(sheet_path)
@@ -350,13 +346,11 @@ def interactive_similar_session(
                 key = _read_key()
 
                 if key == "q":
-                    # Apply pending moves before quitting
                     moved_total += _apply_moves(paths_list, keep, dest_root, dry_run)
-                    cluster_idx = -1  # signal exit
+                    cluster_idx = -1
                     break
 
                 if zoomed:
-                    # Any key returns to overview
                     zoomed = False
                     _show_viewer(sheet_path)
                     _print_cluster_ui(
@@ -380,25 +374,22 @@ def interactive_similar_session(
                         zoomed = True
                         _show_viewer(paths_list[cursor])
                     else:
-                        # Enter = confirm and move to next
                         moved_total += _apply_moves(paths_list, keep, dest_root, dry_run)
                         cluster_idx += 1
                         break
                 elif key == "right":
-                    # Next cluster without confirming (skip)
                     cluster_idx += 1
                     break
                 elif key == "left":
                     cluster_idx = max(0, cluster_idx - 1)
                     break
                 else:
-                    # Try digit keys for quick toggle
                     if key.isdigit():
                         idx = int(key)
                         if idx < len(paths_list):
                             cursor = idx
                             keep[cursor] = not keep[cursor]
-                    continue  # unknown key, skip redraw
+                    continue
 
                 _print_cluster_ui(
                     paths_list, keep, sim_matrix, cursor,
@@ -422,223 +413,8 @@ def interactive_similar_session(
 
 
 # ---------------------------------------------------------------------------
-# tags subcommands (list, search, delete, rename)
+# CLI
 # ---------------------------------------------------------------------------
-
-def collect_tag_index(paths: list[Path]) -> dict[str, list[Path]]:
-    index: dict[str, list[Path]] = {}
-    all_keywords = read_keywords_batch(paths)
-    for path in paths:
-        for tag in all_keywords.get(path, set()):
-            index.setdefault(tag, []).append(path)
-    return dict(sorted(index.items(), key=lambda kv: len(kv[1]), reverse=True))
-
-
-def apply_tag_change(
-    old: str,
-    new: str | None,
-    files: list[Path],
-    dry_run: bool,
-) -> None:
-    if not files:
-        return
-    if dry_run:
-        action = f"rename to '{new}'" if new else "delete"
-        log.info("[DRY RUN] Would %s '%s' in %d file(s)", action, old, len(files))
-        return
-
-    remove_tags(files, [old], dry_run=dry_run)
-
-    if new:
-        for path in files:
-            add_tags(path, [new], dry_run=False)
-
-
-def bulk_delete_tags(
-    tags: list[str],
-    files: list[Path],
-    dry_run: bool,
-) -> None:
-    """Delete multiple tags from multiple files."""
-    if not files or not tags:
-        return
-    if dry_run:
-        log.info("[DRY RUN] Would delete %d tag(s) from %d file(s)", len(tags), len(files))
-        return
-
-    total = len(files)
-    for i in range(0, total, get_config().exiftool.batch_size):
-        batch = files[i:i + get_config().exiftool.batch_size]
-        print(f"\r  Deleting tags from files {i + 1}-{min(i + len(batch), total)}/{total} ...",
-              end="", flush=True, file=sys.stderr)
-        remove_tags(batch, tags, dry_run=dry_run)
-    print(file=sys.stderr)
-
-
-def run_list_tags(args) -> None:
-    paths = find_images(args.path)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    tag_index = collect_tag_index(paths)
-    if not tag_index:
-        print("No tags found.")
-        return
-
-    max_tag_len = max(len(t) for t in tag_index)
-    for tag, files in tag_index.items():
-        print(f"  {tag:<{max_tag_len}}  {len(files):>4} files")
-    print(f"\n{len(tag_index)} unique tags across {len(paths)} files")
-
-
-def run_delete_tag(args) -> None:
-    if not args.tag and not args.pattern:
-        log.error("Provide a tag name or --pattern")
-        sys.exit(1)
-
-    paths = find_images(args.path)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    tag_index = collect_tag_index(paths)
-
-    if args.pattern:
-        import re
-        try:
-            regex = re.compile(args.pattern)
-        except re.error as e:
-            log.error("Invalid regex pattern: %s", e)
-            sys.exit(1)
-        matched = {tag: files for tag, files in tag_index.items() if regex.fullmatch(tag)}
-        if not matched:
-            log.error("No tags match pattern '%s'", args.pattern)
-            sys.exit(1)
-        matched_tags = sorted(matched.keys())
-        affected_files = list({f for files in matched.values() for f in files})
-        log.info("Pattern '%s' matched %d tag(s) across %d file(s):",
-                 args.pattern, len(matched_tags), len(affected_files))
-        for tag in matched_tags:
-            log.info("  %s  (%d files)", tag, len(matched[tag]))
-        bulk_delete_tags(matched_tags, affected_files, args.dry_run)
-        return
-
-    tag = args.tag.lower()
-    files = tag_index.get(tag, [])
-    if not files:
-        log.error("Tag '%s' not found in any files", tag)
-        sys.exit(1)
-
-    log.info("Deleting tag '%s' from %d file(s) ...", tag, len(files))
-    bulk_delete_tags([tag], files, args.dry_run)
-
-
-def run_rename_tag(args) -> None:
-    paths = find_images(args.path)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    tag_index = collect_tag_index(paths)
-    old = args.old.lower()
-    new = args.new.lower()
-    files = tag_index.get(old, [])
-    if not files:
-        log.error("Tag '%s' not found in any files", old)
-        sys.exit(1)
-
-    log.info("Renaming tag '%s' -> '%s' in %d file(s) ...", old, new, len(files))
-    apply_tag_change(old, new, files, args.dry_run)
-
-
-def run_clear_tags(args) -> None:
-    paths = find_images(args.path)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    total = len(paths)
-    if args.dry_run:
-        log.info("[DRY RUN] Would clear tags from %d file(s) "
-                 "(People/* and face regions preserved)", total)
-        return
-
-    try:
-        answer = input(f"Are you sure you want to remove tags from {total} photo(s)? [y/N] ")
-    except EOFError:
-        answer = ""
-    if answer.strip().lower() not in ("y", "yes"):
-        log.info("Aborted.")
-        return
-
-    log.info("Clearing tags from %d file(s) (People/* and face regions preserved) ...", total)
-    clear_all_tags(paths, dry_run=False)
-
-
-def run_search_tags(args) -> None:
-    paths = find_images(args.path)
-    if not paths:
-        log.error("No supported images found at %s", args.path)
-        sys.exit(1)
-
-    tag_index = collect_tag_index(paths)
-    query = args.tag.lower()
-    files = tag_index.get(query, [])
-    if not files:
-        log.error("Tag '%s' not found", query)
-        sys.exit(1)
-
-    for f in sorted(files):
-        print(f)
-    print(f"\n{len(files)} file(s) with tag '{query}'")
-
-
-# ---------------------------------------------------------------------------
-# CLI parsers
-# ---------------------------------------------------------------------------
-
-def build_tags_parser(subparsers) -> None:
-    tags_parser = subparsers.add_parser(
-        "tags",
-        help="Tag management: list, search, delete, rename, clear.",
-    )
-    tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
-
-    p = tags_sub.add_parser("list", help="List all tags with file counts.")
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.set_defaults(func=run_list_tags)
-
-    p = tags_sub.add_parser("search", help="List files that have a given tag.")
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("tag", help="Tag to search for")
-    p.set_defaults(func=run_search_tags)
-
-    p = tags_sub.add_parser("delete", help="Delete a tag (or regex pattern) from all files.")
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("tag", nargs="?", help="Exact tag to delete")
-    p.add_argument("-p", "--pattern", help="Regex pattern to match tags for deletion")
-    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
-    p.set_defaults(func=run_delete_tag)
-
-    p = tags_sub.add_parser("rename", help="Rename a tag across all files.")
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("old", help="Tag to rename")
-    p.add_argument("new", help="New tag name")
-    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
-    p.set_defaults(func=run_rename_tag)
-
-    p = tags_sub.add_parser(
-        "clear",
-        help="Wipe ALL tags and the photo-tools namespace, leaving only original EXIF.",
-    )
-    p.add_argument("path", type=Path, help="Target directory or file")
-    p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
-    p.set_defaults(func=run_clear_tags)
-
-    from photo_tools.debug_viewer import add_inspect_subparser
-    add_inspect_subparser(tags_sub)
-
 
 def build_similar_parser(subparsers) -> argparse.ArgumentParser:
     sub = subparsers.add_parser(

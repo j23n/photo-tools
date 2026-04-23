@@ -5,7 +5,6 @@ metadata (tags, landmarks, GPS, taken_at) in the terminal.  Navigate with
 arrow keys, quit with ``q``.
 """
 
-import argparse
 import logging
 import os
 import platform
