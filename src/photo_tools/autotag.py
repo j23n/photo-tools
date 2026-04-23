@@ -41,6 +41,7 @@ from photo_tools.helpers import (
     leaf_of,
     prepare_image,
     read_exif,
+    read_tagger_versions_batch,
     remove_tags,
     write_embedding,
 )
@@ -691,27 +692,31 @@ def watch_directory(target, dry_run,
     log.info("Watching %s for new images (Ctrl+C to stop) ...", target)
     seen: set[Path] = set()
 
-    for img in find_images(target):
-        if get_tagger_version(read_exif(img)) == TAGGER_VERSION:
+    initial_images = find_images(target)
+    initial_versions = read_tagger_versions_batch(initial_images)
+    for img in initial_images:
+        if initial_versions.get(img) == TAGGER_VERSION:
             seen.add(img.resolve())
     log.info("Found %d already-tagged images, skipping those.", len(seen))
 
     while True:
         try:
-            for img in find_images(target):
-                resolved = img.resolve()
-                if resolved in seen:
-                    continue
-                if get_tagger_version(read_exif(img)) == TAGGER_VERSION:
+            all_images = find_images(target)
+            new_images = [img for img in all_images if img.resolve() not in seen]
+            if new_images:
+                new_versions = read_tagger_versions_batch(new_images)
+                for img in new_images:
+                    resolved = img.resolve()
+                    if new_versions.get(img) == TAGGER_VERSION:
+                        seen.add(resolved)
+                        continue
+                    process_single(img, dry_run, force=False,
+                                   enable_ram=enable_ram,
+                                   enable_landmarks=enable_landmarks,
+                                   enable_ocr=enable_ocr,
+                                   clip_model=clip_model, clip_pretrained=clip_pretrained,
+                                   landmarks_path=landmarks_path)
                     seen.add(resolved)
-                    continue
-                process_single(img, dry_run, force=False,
-                               enable_ram=enable_ram,
-                               enable_landmarks=enable_landmarks,
-                               enable_ocr=enable_ocr,
-                               clip_model=clip_model, clip_pretrained=clip_pretrained,
-                               landmarks_path=landmarks_path)
-                seen.add(resolved)
             time.sleep(5)
         except KeyboardInterrupt:
             log.info("Watch stopped.")
@@ -801,9 +806,26 @@ def run_tag(args) -> None:
 
     log.info("Found %d image(s) to process", len(images))
 
+    skipped = 0
+    if not args.force and not args.clear_all:
+        versions = read_tagger_versions_batch(images)
+        already_tagged = {p for p, v in versions.items() if v == TAGGER_VERSION}
+        if already_tagged:
+            log.info("Skipping %d/%d already tagged (use --force to re-tag)",
+                     len(already_tagged), len(images))
+            for p in already_tagged:
+                log.debug("Skipping %s (already tagged with %s)",
+                          p.name, TAGGER_VERSION)
+            images = [p for p in images if p not in already_tagged]
+            skipped = len(already_tagged)
+
+    if not images:
+        log.info("Done. 0 tagged, %d skipped, 0 failed.", skipped)
+        return
+
     gps_timeline = build_gps_timeline(images) if (enable_ram or enable_landmarks) else {}
 
-    success = failed = skipped = 0
+    success = failed = 0
 
     for i, img in enumerate(images, 1):
         log.info("[%d/%d] %s", i, len(images), img)

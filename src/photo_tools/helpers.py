@@ -418,6 +418,44 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
     return result
 
 
+def read_tagger_versions_batch(paths: list[Path]) -> dict[Path, str]:
+    """Read XMP-phototools:TaggerVersion from many files in batched exiftool calls.
+
+    Only returns entries where the sentinel is present; files without the
+    field are absent from the dict (callers treat missing as "not yet tagged").
+    """
+    if not paths:
+        return {}
+
+    batch_size = get_config().exiftool.batch_size
+    total = len(paths)
+    n_batches = (total + batch_size - 1) // batch_size
+    result: dict[Path, str] = {}
+
+    for batch_idx, i in enumerate(range(0, total, batch_size), 1):
+        batch = paths[i:i + batch_size]
+        log.info("Reading TaggerVersion batch %d/%d (%d files, %d/%d total)",
+                 batch_idx, n_batches, len(batch),
+                 min(i + len(batch), total), total)
+        meta_list = _run_exiftool_json(
+            ["-XMP-phototools:TaggerVersion"] + [str(p) for p in batch],
+            timeout=120,
+        )
+        if not meta_list:
+            continue
+
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            version = meta.get("TaggerVersion")
+            if not version:
+                continue
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            result[path] = str(version)
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Image preparation (convert + downsize)
 # ---------------------------------------------------------------------------
