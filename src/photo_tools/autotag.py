@@ -36,6 +36,7 @@ from photo_tools.helpers import (
     find_images,
     get_existing_keywords,
     get_tagger_version,
+    is_live_photo_motion,
     is_our_tag,
     is_video,
     leaf_of,
@@ -553,6 +554,10 @@ def process_single(
 ) -> bool:
     cfg = get_config()
 
+    if is_live_photo_motion(path):
+        log.info("Skipping %s (Live Photo motion companion)", path.name)
+        return False
+
     video = is_video(path)
     if not video and path.suffix.lower() in IMAGE_EXTENSIONS:
         real_type = detect_real_type(path)
@@ -804,9 +809,21 @@ def run_tag(args) -> None:
         log.error("No supported images found at %s", args.path)
         sys.exit(1)
 
+    skipped = 0
+    motion_companions = [p for p in images if is_live_photo_motion(p)]
+    if motion_companions:
+        log.info("Skipping %d Live Photo motion companion(s)", len(motion_companions))
+        for p in motion_companions:
+            log.debug("Skipping %s (Live Photo motion companion)", p.name)
+        images = [p for p in images if not is_live_photo_motion(p)]
+        skipped += len(motion_companions)
+
+    if not images:
+        log.info("Done. 0 tagged, %d skipped, 0 failed.", skipped)
+        return
+
     log.info("Found %d image(s) to process", len(images))
 
-    skipped = 0
     if not args.force and not args.clear_all:
         versions = read_tagger_versions_batch(images)
         already_tagged = {p for p, v in versions.items() if v == TAGGER_VERSION}
@@ -817,7 +834,7 @@ def run_tag(args) -> None:
                 log.debug("Skipping %s (already tagged with %s)",
                           p.name, TAGGER_VERSION)
             images = [p for p in images if p not in already_tagged]
-            skipped = len(already_tagged)
+            skipped += len(already_tagged)
 
     if not images:
         log.info("Done. 0 tagged, %d skipped, 0 failed.", skipped)
