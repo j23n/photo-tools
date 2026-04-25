@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from photo_tools.config import get_config
-from photo_tools.taxonomy import CATEGORY_CONFIG
+from photo_tools.taxonomy import CATEGORY_CONFIG, THRESHOLD_MARGIN
 
 log = logging.getLogger("ram_tagger")
 
@@ -131,19 +131,20 @@ class RAMTagger:
         """Map scored RAM++ tags to hierarchical taxonomy tags.
 
         Output is `<Category>/<Tag>` (Titlecase, see docs/xmp-schema.md §2).
-        Per-category `max_tags` and `min_confidence` from
-        `taxonomy.CATEGORY_CONFIG` are enforced against the RAM++ sigmoid
-        scores: tags with `score < min_confidence` are dropped before
-        applying `max_tags`. Inputs are assumed to be sorted by score
-        descending (see `_score_tags`).
+        Tags whose sigmoid score is below `threshold * THRESHOLD_MARGIN`
+        (the RAM++ per-class threshold scaled by a margin from
+        `taxonomy.py`) are dropped, then per-category `max_tags` from
+        `taxonomy.CATEGORY_CONFIG` is applied. Inputs are assumed to be
+        sorted by score descending (see `_score_tags`).
         """
         by_category: dict[str, list[str]] = defaultdict(list)
         for raw, _score, _threshold in scored_tags:
             entry = self._mapping.get(raw)
             if entry is None:
                 continue
-            cfg = CATEGORY_CONFIG.get(entry["category"])
-            if cfg is None or _score < cfg["min_confidence"]:
+            if entry["category"] not in CATEGORY_CONFIG:
+                continue
+            if _score < _threshold * THRESHOLD_MARGIN:
                 continue
             by_category[entry["category"]].append(entry["tag"])
 
