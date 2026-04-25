@@ -442,7 +442,11 @@ def run_find_similar(args) -> None:
     threshold = args.threshold if args.threshold is not None else cfg.similarity.threshold
 
     all_files = find_images(args.path)
-    image_paths = [p for p in all_files if p.suffix.lower() in IMAGE_EXTENSIONS]
+    image_paths = [
+        p for p in all_files
+        if p.suffix.lower() in IMAGE_EXTENSIONS
+        and "_duplicates" not in p.parts
+    ]
 
     if not image_paths:
         log.error("No supported images found at %s", args.path)
