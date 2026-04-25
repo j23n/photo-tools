@@ -646,6 +646,20 @@ def is_video(path: Path) -> bool:
     return detect_real_type(path) == "video"
 
 
+def is_live_photo_motion(path: Path) -> bool:
+    """True if filename looks like an Apple Live Photo motion companion.
+
+    Heuristic: a .mov whose stem (case-insensitive) ends in a still-image
+    extension, e.g. IMG_1353.HEIC.MOV or IMG_1353.jpg.mov. The corresponding
+    still file is NOT required to exist — this is purely a filename-shape
+    check.
+    """
+    if path.suffix.lower() != ".mov":
+        return False
+    stem = path.stem.lower()
+    return any(stem.endswith(ext) for ext in (".jpg", ".jpeg", ".heic", ".heif"))
+
+
 # ---------------------------------------------------------------------------
 # Video frame extraction
 # ---------------------------------------------------------------------------
