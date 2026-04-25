@@ -106,18 +106,17 @@ The country code is written separately to `photo-tools:CountryCode` (see
 Concrete things detected by RAM++. Configured in `taxonomy.py`:
 
 - `max_tags`: 5
-- `min_confidence`: 0.6
 
 ### 2.4 Scenes
 
 Scene/setting classification from RAM++. Configured in `taxonomy.py`:
 
 - `max_tags`: 3
-- `min_confidence`: 0.4
 
-Per-category `max_tags` and `min_confidence` are enforced against
-RAM++ sigmoid scores: tags scoring below `min_confidence` are dropped
-before `max_tags` is applied.
+Tags are first gated against RAM++'s per-class thresholds scaled by
+`THRESHOLD_MARGIN` (default 1.10) — a prediction is kept only if its
+sigmoid score is at least `threshold * THRESHOLD_MARGIN`. Per-category
+`max_tags` is then applied to the survivors in score-descending order.
 
 ### 2.5 Landmarks
 
