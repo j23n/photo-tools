@@ -57,26 +57,43 @@ LIMIT {limit}
 """
 
 LANDMARK_TYPES = [
-    # (qid, label, per-type limit)
+    # (qid, label, per-type SPARQL limit)
+    # General
     ("Q570116", "tourist attraction", 2000),
     ("Q839954", "archaeological site", 1500),
     ("Q4989906", "monument", 2000),
     ("Q811979", "architectural structure", 2000),
-    ("Q35112127", "natural landmark", 500),
     ("Q2319498", "landmark", 500),
-    ("Q751876", "castle", 1500),
+    # Religious (spread across regions)
     ("Q16970", "church building", 1500),
     ("Q32815", "mosque", 1500),
     ("Q44539", "temple", 1500),
+    ("Q34627", "synagogue", 500),
+    ("Q160031", "pagoda", 500),
+    ("Q194195", "stupa", 500),
+    ("Q697295", "Shinto shrine", 1000),
+    # Built structures
+    ("Q751876", "castle", 1500),
     ("Q23413", "palace", 1500),
+    ("Q57821", "fortification", 1000),
     ("Q3947", "house", 2000),
     ("Q12280", "bridge", 1500),
+    ("Q12518", "tower", 1500),
+    ("Q39715", "lighthouse", 500),
+    ("Q11303", "skyscraper", 1000),
+    ("Q483453", "fountain", 500),
+    # Cultural
+    ("Q33506", "museum", 1500),
+    ("Q483110", "stadium", 1500),
+    ("Q179700", "statue", 1500),
+    ("Q174782", "town square", 1000),
+    # Natural
+    ("Q35112127", "natural landmark", 500),
     ("Q8502", "mountain", 1500),
+    ("Q8072", "volcano", 500),
     ("Q23397", "lake", 1500),
     ("Q34038", "waterfall", 500),
     ("Q133056", "cave", 500),
-    ("Q33506", "museum", 1500),
-    ("Q483110", "stadium", 1500),
 ]
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -206,37 +223,63 @@ def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[dict]:
 
 
 def query_wikidata(limit: int) -> list[dict]:
-    """Query Wikidata SPARQL for notable landmarks, one type at a time."""
+    """Query Wikidata SPARQL for notable landmarks, one type at a time.
+
+    Each type gets an equal share of *limit* (per-type quota).  Types that
+    return fewer results than their quota leave room for an overflow pass
+    that fills remaining slots from the most notable leftover landmarks
+    across all types.  This prevents high-sitelink European types from
+    crowding out underrepresented regions.
+    """
     log.info("Querying Wikidata for top %d landmarks across %d types ...", limit, len(LANDMARK_TYPES))
 
-    seen_ids: dict[str, dict] = {}
+    seen_ids: set[str] = set()
+    per_type: list[tuple[str, list[dict]]] = []
+
     for qid, label, type_limit in LANDMARK_TYPES:
         log.info("  Querying %s (%s, limit %d) ...", label, qid, type_limit)
         query = SPARQL_TYPE_QUERY.format(qid=qid, limit=type_limit)
         results = _sparql_get(query)
         log.info("  Got %d results for %s", len(results), label)
 
+        type_results: list[dict] = []
         for r in results:
             wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
             if wikidata_id in seen_ids:
                 continue
-            seen_ids[wikidata_id] = {
+            seen_ids.add(wikidata_id)
+            type_results.append({
                 "name": r["itemLabel"]["value"],
                 "wikidata_id": wikidata_id,
                 "lat": float(r["lat"]["value"]),
                 "lon": float(r["lon"]["value"]),
                 "image_url": r["image"]["value"],
                 "_sitelinks": int(r["sitelinks"]["value"]),
-            }
-        # Be kind to the endpoint between type queries
+            })
+        # Results arrive sorted by sitelinks desc from SPARQL ORDER BY
+        per_type.append((label, type_results))
         time.sleep(2)
 
-    # Sort by sitelinks descending and take top `limit`
-    landmarks = sorted(seen_ids.values(), key=lambda x: x["_sitelinks"], reverse=True)[:limit]
+    # Per-type quotas: each type gets an equal share, then overflow fills
+    # remaining slots from the most notable leftover landmarks globally
+    quota = limit // len(LANDMARK_TYPES)
+    landmarks: list[dict] = []
+    overflow: list[dict] = []
+
+    for label, type_results in per_type:
+        landmarks.extend(type_results[:quota])
+        overflow.extend(type_results[quota:])
+
+    remaining = limit - len(landmarks)
+    if remaining > 0:
+        overflow.sort(key=lambda x: x["_sitelinks"], reverse=True)
+        landmarks.extend(overflow[:remaining])
+
     for lm in landmarks:
         del lm["_sitelinks"]
 
-    log.info("Deduplicated to %d unique landmarks (top %d kept)", len(landmarks), limit)
+    log.info("Selected %d landmarks (%d per-type quota, %d types)",
+             len(landmarks), quota, len(LANDMARK_TYPES))
     return landmarks
 
 
@@ -244,11 +287,16 @@ def query_wikidata_geo(
     regions: list[tuple[str, float, float, float, float]],
     limit: int,
 ) -> list[dict]:
-    """Query Wikidata for notable landmarks within geographic bounding boxes."""
+    """Query Wikidata for notable landmarks within geographic bounding boxes.
+
+    Uses the same per-type quota strategy as :func:`query_wikidata`.
+    """
     log.info("Querying Wikidata for top %d landmarks in %d regions ...",
              limit, len(regions))
 
-    seen_ids: dict[str, dict] = {}
+    seen_ids: set[str] = set()
+    per_type: dict[str, list[dict]] = {}
+
     for region_name, lat_min, lat_max, lon_min, lon_max in regions:
         log.info("Region: %s (lat %.2f–%.2f, lon %.2f–%.2f)",
                  region_name, lat_min, lat_max, lon_min, lon_max)
@@ -262,27 +310,42 @@ def query_wikidata_geo(
             results = _sparql_get(query)
             if results:
                 log.info("  %s / %s: %d results", region_name, label, len(results))
+            type_results = per_type.setdefault(label, [])
             for r in results:
                 wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
                 if wikidata_id in seen_ids:
                     continue
-                seen_ids[wikidata_id] = {
+                seen_ids.add(wikidata_id)
+                type_results.append({
                     "name": r["itemLabel"]["value"],
                     "wikidata_id": wikidata_id,
                     "lat": float(r["lat"]["value"]),
                     "lon": float(r["lon"]["value"]),
                     "image_url": r["image"]["value"],
                     "_sitelinks": int(r["sitelinks"]["value"]),
-                }
+                })
             time.sleep(1)
 
-    landmarks = sorted(seen_ids.values(), key=lambda x: x["_sitelinks"],
-                       reverse=True)[:limit]
+    # Per-type quotas with overflow (same as query_wikidata)
+    quota = limit // max(len(per_type), 1)
+    landmarks: list[dict] = []
+    overflow: list[dict] = []
+
+    for label, type_results in per_type.items():
+        type_results.sort(key=lambda x: x["_sitelinks"], reverse=True)
+        landmarks.extend(type_results[:quota])
+        overflow.extend(type_results[quota:])
+
+    remaining = limit - len(landmarks)
+    if remaining > 0:
+        overflow.sort(key=lambda x: x["_sitelinks"], reverse=True)
+        landmarks.extend(overflow[:remaining])
+
     for lm in landmarks:
         del lm["_sitelinks"]
 
-    log.info("Found %d unique landmarks across regions (top %d kept)",
-             len(seen_ids), len(landmarks))
+    log.info("Found %d unique landmarks across regions (%d per-type quota, %d kept)",
+             len(seen_ids), quota, len(landmarks))
     return landmarks
 
 

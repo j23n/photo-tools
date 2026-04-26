@@ -13,6 +13,6 @@ See docs/xmp-schema.md §2 for the full taxonomy spec.
 THRESHOLD_MARGIN = 1.10
 
 CATEGORY_CONFIG = {
-    "Objects": {"max_tags": 5},
-    "Scenes":  {"max_tags": 3},
+    "Objects": {"max_tags": 8},
+    "Scenes":  {"max_tags": 6},
 }
