@@ -733,7 +733,8 @@ def watch_directory(target, dry_run,
 # ---------------------------------------------------------------------------
 
 def _add_tag_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", type=Path, help="Image file or directory")
+    parser.add_argument("path", type=Path, nargs="+",
+                        help="Image file(s) or directory (one or more)")
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help="Preview tags without writing")
     parser.add_argument("-f", "--force", action="store_true",
@@ -794,19 +795,27 @@ def run_tag(args) -> None:
     log.info("Tag sources: %s", " + ".join(sources))
 
     if args.watch:
-        if not args.path.is_dir():
-            log.error("--watch requires a directory")
+        if len(args.path) != 1 or not args.path[0].is_dir():
+            log.error("--watch requires a single directory")
             sys.exit(1)
-        watch_directory(args.path, args.dry_run,
+        watch_directory(args.path[0], args.dry_run,
                         enable_ram, enable_landmarks, enable_ocr,
                         clip_model=args.clip_model,
                         clip_pretrained=args.clip_pretrained,
                         landmarks_path=args.landmarks_db)
         return
 
-    images = find_images(args.path)
+    images: list[Path] = []
+    seen: set[Path] = set()
+    for p in args.path:
+        for img in find_images(p):
+            resolved = img.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                images.append(img)
     if not images:
-        log.error("No supported images found at %s", args.path)
+        log.error("No supported images found at %s",
+                  ", ".join(str(p) for p in args.path))
         sys.exit(1)
 
     skipped = 0
