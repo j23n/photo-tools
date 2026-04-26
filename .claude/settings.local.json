@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sL \"https://raw.githubusercontent.com/xinyu1205/recognize-anything/main/ram/data/ram_tag_list_threshold.txt\" -o /tmp/ram_tag_list_threshold.txt)",
+      "Read(//tmp/**)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -sL https://*)",
+      "Bash(ls -la batch_*.json)",
+      "Bash(python3 -c 'import json; json.load\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\)\\)')",
+      "WebSearch",
+      "Bash(gh issue:*)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(grep:*)",
+      "Bash(uv run:*)",
+      "Bash(curl -s 'https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=haswbstatement:P180=Q10285&gsrnamespace=6&gsrlimit=5&prop=imageinfo&iiprop=size|mime&format=json')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s 'https://www.wikidata.org/w/api.php?action=wbgetentities&ids=Q10285&props=claims&format=json')",
+      "Bash(python3 -c ':*)",
+      "Bash(curl -s 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search=Basilica+of+San+Petronio&language=en&limit=3&format=json')"
+    ]
+  }
+}
