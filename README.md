@@ -46,7 +46,7 @@ photo-tools find-similar /path/to/photos
 
 # Tag management
 photo-tools tags list /path/to/photos                   # list all tags with counts
-photo-tools tags search /path/to/photos "Objects/Cat"   # show files with this tag
+photo-tools tags search /path/to/photos "Objects/Animal/Cat"   # show files with this tag
 photo-tools tags delete /path/to/photos "old-tag"       # remove a tag everywhere
 photo-tools tags rename /path/to/photos "old" "new"     # rename across collection
 photo-tools tags clear /path/to/photos                  # wipe tags (keeps People/* + face regions; prompts before writing)
@@ -89,7 +89,7 @@ src/photo_tools/
   drop_digikam_tags.py    DigiKam tag cleanup
 
   exiftool_phototools.config   ExifTool XMP namespace config
-  data/ram_tag_mapping.yaml    RAM++ tag → taxonomy mapping (14k entries)
+  data/ram_tag_mapping.yaml    RAM++ tag → taxonomy mapping (~4580 entries)
 ```
 
 All thresholds and parameters live in `default_config.yaml` and can be overridden with `--config path/to/overrides.yaml`. The XMP/IPTC schema photo-tools writes — including the `photo-tools:` custom namespace — is documented in [`docs/xmp-schema.md`](docs/xmp-schema.md).

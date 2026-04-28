@@ -2,8 +2,9 @@
 ram_tagger.py — RAM++ (Recognize Anything Plus Plus) image tagger.
 
 Replaces the two-stage CLIP zero-shot tagger with a purpose-built
-multi-label recognition model. Uses a JSON mapping to convert RAM++
-tag predictions to the hierarchical taxonomy (category/tag format).
+multi-label recognition model. Uses a YAML mapping to convert RAM++
+tag predictions to hierarchical taxonomy paths
+(e.g. Objects/Animal/Mammal/Cat, Scenes/Urban/Street).
 """
 
 import logging
@@ -128,10 +129,11 @@ class RAMTagger:
     def _map_tags(
         self, scored_tags: list[tuple[str, float, float]],
     ) -> list[str]:
-        """Map scored RAM++ tags to hierarchical taxonomy tags.
+        """Map scored RAM++ tags to hierarchical taxonomy paths.
 
-        Output is `<Category>/<Tag>` (Titlecase, see docs/xmp-schema.md §2).
-        Tags whose sigmoid score is below `threshold * THRESHOLD_MARGIN`
+        Output is `<Category>/<Subcategory>/…/<Leaf>` (Titlecase, see
+        docs/xmp-schema.md §2). Tags whose sigmoid score is below
+        `threshold * THRESHOLD_MARGIN`
         (the RAM++ per-class threshold scaled by a margin from
         `taxonomy.py`) are dropped, then per-category `max_tags` from
         `taxonomy.CATEGORY_CONFIG` is applied. Inputs are assumed to be

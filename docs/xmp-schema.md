@@ -77,10 +77,13 @@ Top-level roots in `digiKam:TagsList`:
 People/<name>                                        ← digiKam-owned
 Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]
 Landmarks/<name>
-Objects/<thing>
-Scenes/<scene>
+Objects/<TopLevel>/<SubCategory>/<Leaf>
+Scenes/<TopLevel>/<SubCategory>/<Leaf>
 Text/<phrase>
 ```
+
+Objects and Scenes use 2–3 path segments (leaf nodes may be 2 levels when
+the subcategory itself is the useful term, e.g. `Nature/Forest`).
 
 ### 2.1 People
 
@@ -107,6 +110,33 @@ Concrete things detected by RAM++. Configured in `taxonomy.py`:
 
 - `max_tags`: 5
 
+Tags use the following top-level hierarchy (22 roots):
+
+| Root | Covers |
+| --- | --- |
+| `Animal` | Mammals, birds, fish, insects, reptiles, amphibians, invertebrates, aquatic life |
+| `Appliance` | Home appliances (standalone subcategory under `Household`) |
+| `Art` | Paintings, drawings, sculptures, murals, calligraphy, collage |
+| `Artifact` | Books, historical/ceremonial objects, fossils, relics |
+| `Clothing` | Tops, bottoms, outerwear, footwear, headwear, accessories, swimwear, workwear |
+| `Container` | Bags, boxes, bottles, jars, baskets, cases |
+| `Electronics` | Computers, phones, audio/video gear, cameras, networking, displays |
+| `Food` | Fruit, vegetables, meat, seafood, dairy, baked goods, beverages, condiments |
+| `Furniture` | Seating, beds, tables, storage, office furniture |
+| `Household` | Kitchenware, linens, lighting, timekeeping, bathroom, baby items |
+| `Instrument` | String, wind, brass, percussion, keyboard instruments |
+| `Medical` | Medicine, equipment, mobility aids, safety |
+| `Nature` | Rocks, minerals, wood, water, sky, celestial, natural materials |
+| `Person` | Roles, costumes, uniforms, professions depicted in-image |
+| `Plant` | Trees, flowers, shrubs, succulents, ferns, vines, fungi, crops, herbs |
+| `Sport` | Equipment and gear by sport |
+| `Structure` | Buildings, bridges, towers, infrastructure, architectural elements |
+| `Tool` | Hand tools, power tools, gardening, woodworking, measurement |
+| `Toy` | Dolls, games, puzzles, toy vehicles, play equipment |
+| `Urban` | Signs, street elements, lighting, windows, fences, walls |
+| `Vehicle` | Cars, trucks, buses, aircraft, watercraft, rail, bikes |
+| `Weapon` | Firearms, blades, projectiles, armor, military equipment |
+
 ### 2.4 Scenes
 
 Scene/setting classification from RAM++. Configured in `taxonomy.py`:
@@ -117,6 +147,17 @@ Tags are first gated against RAM++'s per-class thresholds scaled by
 `THRESHOLD_MARGIN` (default 1.10) — a prediction is kept only if its
 sigmoid score is at least `threshold * THRESHOLD_MARGIN`. Per-category
 `max_tags` is then applied to the survivors in score-descending order.
+
+Scenes use the following top-level hierarchy (6 roots):
+
+| Root | Subcategories |
+| --- | --- |
+| `Interior` | Domestic, Work, Other, Vehicle |
+| `Nature` | Coastal, Forest, Landscape, Mountain, Phenomenon, Vegetation, Water |
+| `Sky` | (flat — celestial bodies and events) |
+| `Urban` | District, Park, Square, Street, Waterfront |
+| `Venue` | Agricultural, Civic, Cultural, Dining, Historical, Hospitality, Industrial, Market, Religious, Residential, Retail, Sport, Transport, Wellness |
+| `Weather` | (flat — season and condition tags) |
 
 ### 2.5 Landmarks
 
