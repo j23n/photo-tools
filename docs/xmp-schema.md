@@ -188,8 +188,13 @@ Instead it is stored in two places:
    ```
    exiftool -if '$OCRText =~ /pizza/i' -OCRText FILE
    ```
-2. **IPTC `ImageRegion`** / **MWG `RegionInfo`** — one entry per phrase with
-   bounding-box coordinates so consumers can locate the text in the image.
+2. **IPTC `ImageRegion`** — one entry per phrase with bounding-box
+   coordinates and `RRole=annotatedText`, so consumers can locate the text
+   in the image. OCR phrases are deliberately **not** written to
+   `XMP-mwg-rs:RegionInfo`: digiKam's People view surfaces any named MWG-RS
+   region regardless of `Type`, so phrases like "Way out" would pollute the
+   face tree. IPTC `ImageRegion` is the correct schema for OCR text and
+   is not consumed by digiKam's People view.
 
 This avoids polluting the digiKam tag tree with throwaway OCR phrases.
 Confidence and length filters are configured under `ocr.*` in

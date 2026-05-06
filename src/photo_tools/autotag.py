@@ -397,36 +397,36 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# OCR region writing (IPTC ImageRegion + MWG RegionInfo)
+# OCR region writing (IPTC ImageRegion only)
+#
+# OCR phrases are deliberately NOT written to XMP-mwg-rs:RegionInfo. That
+# schema is read by digiKam's People view, which surfaces any named region
+# regardless of Type — so a phrase like "Way out" pollutes the face tree.
+# IPTC ImageRegion already carries the bounding box with role=annotatedText,
+# which is the correct schema for OCR text.
 # ---------------------------------------------------------------------------
 
-def _read_existing_regions(path: Path) -> tuple[list[dict], list[dict], dict | None]:
-    """Read existing MWG and IPTC regions, returning non-OCR regions to preserve."""
+def _read_existing_iptc_regions(path: Path) -> list[dict]:
+    """Read non-OCR IPTC ImageRegion entries to preserve on rewrite."""
     try:
         meta = _run_exiftool_json(
-            ["-struct", "-XMP-mwg-rs:RegionInfo", "-XMP-iptcExt:ImageRegion", str(path)],
+            ["-struct", "-XMP-iptcExt:ImageRegion", str(path)],
             with_config=False, timeout=30,
         )
         if not meta:
-            return [], [], None
+            return []
         data = meta[0]
     except Exception:
-        return [], [], None
+        return []
 
-    region_info = data.get("RegionInfo") or {}
-    existing_mwg = [r for r in (region_info.get("RegionList") or [])
-                    if r.get("Type") != "BarCode"]
-    applied_dims = region_info.get("AppliedToDimensions")
-
-    existing_iptc = []
+    existing = []
     for r in data.get("ImageRegion") or []:
         roles = r.get("RRole") or []
         is_ocr = any("annotatedText" in (ident or "")
                       for role in roles for ident in (role.get("Identifier") or []))
         if not is_ocr:
-            existing_iptc.append(r)
-
-    return existing_mwg, existing_iptc, applied_dims
+            existing.append(r)
+    return existing
 
 
 def write_text_regions(
@@ -435,7 +435,7 @@ def write_text_regions(
     regions: list[dict],
     dry_run: bool = False,
 ) -> bool:
-    """Write OCR text as XMP-phototools:OCRText + IPTC ImageRegion + MWG Region.
+    """Write OCR text as XMP-phototools:OCRText + IPTC ImageRegion.
 
     Caller is responsible for writing the XMP-phototools:OCRRan marker —
     this function is a no-op when there are no regions to write."""
@@ -445,10 +445,7 @@ def write_text_regions(
         log.info("[DRY RUN] Would write %d text regions to %s", len(regions), path.name)
         return True
 
-    existing_mwg, existing_iptc, applied_dims = _read_existing_regions(path)
-
-    iptc_regions = list(existing_iptc)
-    mwg_regions = list(existing_mwg)
+    iptc_regions = list(_read_existing_iptc_regions(path))
     for r in regions:
         iptc_regions.append({
             "Name": r["text"],
@@ -460,28 +457,11 @@ def write_text_regions(
                 "RbW": round(r["w"], 5), "RbH": round(r["h"], 5),
             },
         })
-        mwg_regions.append({
-            "Name": r["text"],
-            "Type": "BarCode",
-            "Description": "OCR detected text",
-            "Area": {
-                "X": round(r["x"] + r["w"] / 2, 5),
-                "Y": round(r["y"] + r["h"] / 2, 5),
-                "W": round(r["w"], 5),
-                "H": round(r["h"], 5),
-                "Unit": "normalized",
-            },
-        })
-
-    mwg_info = {"RegionList": mwg_regions}
-    if applied_dims:
-        mwg_info["AppliedToDimensions"] = applied_dims
 
     meta = {
         "SourceFile": str(path),
         "XMP-phototools:OCRText": phrases,
         "XMP-iptcExt:ImageRegion": iptc_regions,
-        "XMP-mwg-rs:RegionInfo": mwg_info,
     }
 
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
