@@ -5,13 +5,11 @@ via ExifTool (with DigiKam hierarchical tag support).
 """
 
 import argparse
-import json
 import logging
 import os
 import sys
-import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -26,12 +24,11 @@ from photo_tools.constants import (
     VALID_ONSETS,
 )
 from photo_tools.helpers import (
-    _run_exiftool,
     _run_exiftool_json,
-    add_tags,
     clear_all_keywords,
     deduplicate,
     detect_real_type,
+    existing_non_ocr_regions,
     extract_video_frame,
     find_images,
     get_existing_keywords,
@@ -44,7 +41,7 @@ from photo_tools.helpers import (
     read_exif,
     read_tagger_versions_batch,
     remove_tags,
-    write_embedding,
+    write_metadata,
 )
 
 try:
@@ -397,111 +394,6 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# OCR region writing (IPTC ImageRegion only)
-#
-# OCR phrases are deliberately NOT written to XMP-mwg-rs:RegionInfo. That
-# schema is read by digiKam's People view, which surfaces any named region
-# regardless of Type — so a phrase like "Way out" pollutes the face tree.
-# IPTC ImageRegion already carries the bounding box with role=annotatedText,
-# which is the correct schema for OCR text.
-# ---------------------------------------------------------------------------
-
-def _read_existing_iptc_regions(path: Path) -> list[dict]:
-    """Read non-OCR IPTC ImageRegion entries to preserve on rewrite."""
-    try:
-        meta = _run_exiftool_json(
-            ["-struct", "-XMP-iptcExt:ImageRegion", str(path)],
-            with_config=False, timeout=30,
-        )
-        if not meta:
-            return []
-        data = meta[0]
-    except Exception:
-        return []
-
-    existing = []
-    for r in data.get("ImageRegion") or []:
-        roles = r.get("RRole") or []
-        is_ocr = any("annotatedText" in (ident or "")
-                      for role in roles for ident in (role.get("Identifier") or []))
-        if not is_ocr:
-            existing.append(r)
-    return existing
-
-
-def write_text_regions(
-    path: Path,
-    phrases: list[str],
-    regions: list[dict],
-    dry_run: bool = False,
-) -> bool:
-    """Write OCR text as XMP-phototools:OCRText + IPTC ImageRegion.
-
-    Caller is responsible for writing the XMP-phototools:OCRRan marker —
-    this function is a no-op when there are no regions to write."""
-    if not regions:
-        return True
-    if dry_run:
-        log.info("[DRY RUN] Would write %d text regions to %s", len(regions), path.name)
-        return True
-
-    iptc_regions = list(_read_existing_iptc_regions(path))
-    for r in regions:
-        iptc_regions.append({
-            "Name": r["text"],
-            "RRole": [{"Identifier": ["http://cv.iptc.org/newscodes/imageregionrole/annotatedText"],
-                        "Name": "annotated text"}],
-            "RegionBoundary": {
-                "RbShape": "rectangle", "RbUnit": "relative",
-                "RbX": round(r["x"], 5), "RbY": round(r["y"], 5),
-                "RbW": round(r["w"], 5), "RbH": round(r["h"], 5),
-            },
-        })
-
-    meta = {
-        "SourceFile": str(path),
-        "XMP-phototools:OCRText": phrases,
-        "XMP-iptcExt:ImageRegion": iptc_regions,
-    }
-
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-    try:
-        json.dump([meta], tmp)
-        tmp.close()
-        result = _run_exiftool(
-            ["-overwrite_original", "-struct", f"-json={tmp.name}", str(path)],
-            with_config=True, timeout=60,
-        )
-        if result.returncode != 0:
-            log.error("exiftool region write failed for %s: %s", path.name, result.stderr.strip())
-            return False
-        log.info("Wrote %d text regions to %s", len(regions), path.name)
-        return True
-    except Exception as e:
-        log.error("Failed to write text regions to %s: %s", path.name, e)
-        return False
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-
-
-def write_ocr_ran(path: Path, dry_run: bool = False) -> None:
-    """Stamp XMP-phototools:OCRRan with the current UTC timestamp."""
-    if dry_run:
-        return
-    ts = datetime.now(timezone.utc).isoformat()
-    result = _run_exiftool(
-        ["-overwrite_original", f"-XMP-phototools:OCRRan={ts}", str(path)],
-        with_config=True, timeout=30,
-    )
-    if result.returncode != 0:
-        log.warning("Failed to write OCRRan marker for %s: %s",
-                    path.name, result.stderr.strip())
-
-
-# ---------------------------------------------------------------------------
 # Lazy-initialized ML singletons
 # ---------------------------------------------------------------------------
 
@@ -685,26 +577,28 @@ def process_single(
     if country_code:
         namespace_fields["CountryCode"] = country_code
 
-    ok = True
-    if new_tags or namespace_fields or stored_version != TAGGER_VERSION:
-        ok = add_tags(path, new_tags, dry_run, namespace_fields=namespace_fields)
-    else:
-        log.info("No new keywords for %s", path.name)
+    embedding_model_id = (
+        _get_clip_embedder(clip_model, clip_pretrained).model_id
+        if embedding is not None else None
+    )
+    existing_iptc_regions = (
+        existing_non_ocr_regions(exif) if ocr_regions else None
+    )
 
-    if ok and ocr_regions:
-        write_text_regions(path, ocr_phrases, ocr_regions, dry_run)
-
-    # Stamp OCRRan whenever the OCR pipeline ran for this photo, so a future
-    # `tag fix` knows OCR has been considered (even when nothing was detected).
-    if ok and enable_ocr and visual_path:
-        write_ocr_ran(path, dry_run)
-
-    # Write embedding last — after all other exiftool calls that rewrite XMP.
-    if embedding is not None and not dry_run:
-        model_id = _get_clip_embedder(clip_model, clip_pretrained).model_id
-        write_embedding(path, embedding, model_id, dry_run)
-
-    return ok
+    return write_metadata(
+        path,
+        new_keywords=new_tags,
+        namespace_fields=namespace_fields,
+        ocr_text=ocr_phrases if ocr_regions else None,
+        new_ocr_regions=ocr_regions or None,
+        existing_iptc_regions=existing_iptc_regions,
+        embedding=embedding,
+        embedding_model=embedding_model_id,
+        # Stamp OCRRan whenever the OCR pipeline ran, so a future `tag fix`
+        # knows OCR has been considered (even when nothing was detected).
+        stamp_ocr_ran=bool(enable_ocr and visual_path),
+        dry_run=dry_run,
+    )
 
 
 # ---------------------------------------------------------------------------

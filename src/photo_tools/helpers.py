@@ -355,7 +355,8 @@ def read_exif(path: Path) -> dict:
         "-File:ImageWidth", "-File:ImageHeight",
         "-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList",
         "-XMP-phototools:TaggerVersion",
-        "-n",
+        "-XMP-iptcExt:ImageRegion",
+        "-struct", "-n",
     ]
     try:
         meta = _run_exiftool_json(fields + [str(path)], timeout=30)
@@ -363,6 +364,25 @@ def read_exif(path: Path) -> dict:
     except Exception as e:
         log.warning("Could not read EXIF from %s: %s", path, e)
         return {}
+
+
+def existing_non_ocr_regions(exif: dict) -> list[dict]:
+    """Return IPTC ImageRegion entries whose role is NOT 'annotatedText'.
+
+    Used to preserve face/manual regions when rewriting OCR regions.
+    Operates on an `exif` dict produced by `read_exif` (which fetches
+    `XMP-iptcExt:ImageRegion` with `-struct`).
+    """
+    out = []
+    for r in exif.get("ImageRegion") or []:
+        roles = r.get("RRole") or []
+        is_ocr = any(
+            "annotatedText" in (ident or "")
+            for role in roles for ident in (role.get("Identifier") or [])
+        )
+        if not is_ocr:
+            out.append(r)
+    return out
 
 
 def get_existing_keywords(exif: dict) -> set[str]:
@@ -867,6 +887,142 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
     if result.returncode != 0:
         log.warning("Failed to cache embedding for %s: %s",
                     path.name, result.stderr.strip())
+
+
+# IPTC role identifier marking a region as OCR-derived text. Mirrored on read
+# in `existing_non_ocr_regions` so we can rewrite OCR regions without
+# clobbering face/manual regions other tools have written.
+_OCR_ROLE_IDENTIFIER = "http://cv.iptc.org/newscodes/imageregionrole/annotatedText"
+
+
+def write_metadata(
+    path: Path,
+    *,
+    new_keywords: list[str] = (),
+    namespace_fields: dict[str, str] | None = None,
+    ocr_text: list[str] | None = None,
+    new_ocr_regions: list[dict] | None = None,
+    existing_iptc_regions: list[dict] | None = None,
+    embedding: np.ndarray | None = None,
+    embedding_model: str | None = None,
+    stamp_ocr_ran: bool = False,
+    dry_run: bool = False,
+) -> bool:
+    """Single-spawn metadata write for the autotag inner loop.
+
+    Consolidates keyword adds, photo-tools namespace fields, OCR text/regions,
+    OCRRan stamp, CLIP embedding, and the TaggerVersion+TaggedAt sentinel
+    into one exiftool invocation. Keywords use `+=` so non-photo-tools tags
+    are preserved; structural fields (IPTC:ImageRegion, OCRText) ride along
+    in a JSON sidecar passed in the same exiftool call.
+    """
+    has_anything = bool(
+        new_keywords or namespace_fields or ocr_text or new_ocr_regions
+        or embedding is not None or stamp_ocr_ran
+    )
+    if not has_anything:
+        return False
+
+    if dry_run:
+        log.info("[DRY RUN] Would write to %s:", path.name)
+        if new_keywords:
+            log.info("  %d keyword(s):", len(new_keywords))
+            for kw in sorted(new_keywords):
+                log.info("    %s", kw)
+        for k, v in sorted((namespace_fields or {}).items()):
+            log.info("    photo-tools:%s = %s", k, v)
+        if new_ocr_regions:
+            log.info("  %d OCR region(s)", len(new_ocr_regions))
+        if stamp_ocr_ran:
+            log.info("    photo-tools:OCRRan")
+        if embedding is not None:
+            log.info("    photo-tools:CLIPEmbedding (%s)", embedding_model or "?")
+        return True
+
+    ts = datetime.now(timezone.utc).isoformat()
+    args = ["-overwrite_original"]
+
+    for kw in new_keywords:
+        args.extend(_build_tag_args(kw, "+="))
+
+    args.extend([
+        f"-XMP-phototools:TaggerVersion={TAGGER_VERSION}",
+        f"-XMP-phototools:TaggedAt={ts}",
+    ])
+    for field, value in (namespace_fields or {}).items():
+        args.append(f"-XMP-phototools:{field}={value}")
+    if stamp_ocr_ran:
+        args.append(f"-XMP-phototools:OCRRan={ts}")
+    if embedding is not None:
+        b64 = base64.b64encode(embedding.astype(np.float32).tobytes()).decode()
+        args.append(f"-XMP-phototools:CLIPEmbedding={b64}")
+        if embedding_model:
+            args.append(f"-XMP-phototools:CLIPModel={embedding_model}")
+
+    tmp_path: str | None = None
+    if new_ocr_regions:
+        iptc_regions = list(existing_iptc_regions or [])
+        for r in new_ocr_regions:
+            iptc_regions.append({
+                "Name": r["text"],
+                "RRole": [{
+                    "Identifier": [_OCR_ROLE_IDENTIFIER],
+                    "Name": "annotated text",
+                }],
+                "RegionBoundary": {
+                    "RbShape": "rectangle", "RbUnit": "relative",
+                    "RbX": round(r["x"], 5), "RbY": round(r["y"], 5),
+                    "RbW": round(r["w"], 5), "RbH": round(r["h"], 5),
+                },
+            })
+        sidecar = {
+            "SourceFile": str(path),
+            "XMP-iptcExt:ImageRegion": iptc_regions,
+        }
+        if ocr_text:
+            sidecar["XMP-phototools:OCRText"] = ocr_text
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump([sidecar], tmp)
+        tmp.close()
+        tmp_path = tmp.name
+        args = ["-struct", f"-json={tmp_path}"] + args
+    elif ocr_text:
+        # OCR text without regions — clear + append on CLI to replace any prior list
+        args.append("-XMP-phototools:OCRText=")
+        for phrase in ocr_text:
+            args.append(f"-XMP-phototools:OCRText+={phrase}")
+
+    args.append(str(path))
+
+    try:
+        result = _run_exiftool(args, timeout=60)
+        if result.returncode != 0:
+            log.error("exiftool failed for %s: %s", path.name, result.stderr.strip())
+            return False
+        parts = []
+        if new_keywords:
+            parts.append(f"{len(new_keywords)} keyword(s)")
+        if new_ocr_regions:
+            parts.append(f"{len(new_ocr_regions)} OCR region(s)")
+        if embedding is not None:
+            parts.append("embedding")
+        if parts:
+            log.info("Wrote %s to %s", " + ".join(parts), path.name)
+        else:
+            log.debug("Updated metadata sentinel on %s", path.name)
+        return True
+    except FileNotFoundError:
+        log.error("exiftool not found. Install with: brew install exiftool")
+        sys.exit(1)
+    except Exception as e:
+        log.error("Failed to write metadata to %s: %s", path.name, e)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
