@@ -9,7 +9,6 @@ LandmarkIndex.
 
 import io
 import json
-import logging
 import sys
 import time
 import urllib.parse
@@ -21,8 +20,9 @@ import requests
 from PIL import Image, ImageOps
 
 from photo_tools.config import get_config
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("build_landmarks")
+log = get_logger("build_landmarks")
 
 # Per-type SPARQL query — uses direct P31 only (no recursive P279* subclass traversal)
 SPARQL_TYPE_QUERY = """\

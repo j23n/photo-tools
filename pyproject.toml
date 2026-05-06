@@ -23,6 +23,7 @@ dependencies = [
     "fairscale==0.4.4",
     "Pillow",
     "titlecase>=2.4",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]

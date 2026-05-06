@@ -11,7 +11,6 @@ so previously-moved images can be restored across sessions.
 
 import argparse
 import json
-import logging
 import math
 import os
 import sys
@@ -33,8 +32,9 @@ from photo_tools.helpers import (
     read_cached_embeddings_batch,
     write_embedding,
 )
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("duplicates")
+log = get_logger("duplicates")
 
 
 # Hard cap on cluster size. Above this the cluster is recursively split at a

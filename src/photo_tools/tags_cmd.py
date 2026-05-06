@@ -5,7 +5,6 @@ list / search / delete / rename / clear / inspect (the inspect leaf is
 defined in debug_viewer and registered here).
 """
 
-import logging
 import sys
 from pathlib import Path
 
@@ -17,8 +16,9 @@ from photo_tools.helpers import (
     read_keywords_batch,
     remove_tags,
 )
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("tags_cmd")
+log = get_logger("tags")
 
 
 # ---------------------------------------------------------------------------

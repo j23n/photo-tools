@@ -5,7 +5,6 @@ Exiftool operations, file discovery, image preparation, and embedding cache.
 
 import base64
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -22,8 +21,9 @@ from photo_tools.constants import (
     TAGGER_VERSION,
     VIDEO_EXTENSIONS,
 )
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("helpers")
+log = get_logger("exif")
 
 # Path to our exiftool config registering the photo-tools XMP namespace.
 # See docs/xmp-schema.md §1.2 and exiftool_phototools.config.

@@ -5,7 +5,6 @@ metadata (tags, landmarks, GPS, taken_at) in the terminal.  Navigate with
 arrow keys, quit with ``q``.
 """
 
-import logging
 import os
 import platform
 import signal
@@ -18,8 +17,9 @@ from pathlib import Path
 
 from photo_tools.autotag import get_gps_coords, _parse_exif_datetime
 from photo_tools.helpers import find_images, get_existing_keywords, read_exif
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("inspect")
+log = get_logger("inspect")
 
 
 # ---------------------------------------------------------------------------

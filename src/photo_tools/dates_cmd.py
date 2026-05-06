@@ -10,7 +10,6 @@ which source supplied the date (e.g. "filename:whatsapp", "mtime") so the
 backfill is auditable and reversible later.
 """
 
-import logging
 import re
 import sys
 from datetime import datetime
@@ -21,8 +20,9 @@ from photo_tools.helpers import (
     read_dates_batch,
     write_dates,
 )
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("dates_cmd")
+log = get_logger("dates")
 
 
 # ---------------------------------------------------------------------------

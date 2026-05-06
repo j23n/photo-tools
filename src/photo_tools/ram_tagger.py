@@ -7,16 +7,16 @@ tag predictions to hierarchical taxonomy paths
 (e.g. Objects/Animal/Mammal/Cat, Scenes/Urban/Street).
 """
 
-import logging
 from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
 from photo_tools.config import get_config
+from photo_tools.logging_setup import get_logger
 from photo_tools.taxonomy import CATEGORY_CONFIG, THRESHOLD_MARGIN
 
-log = logging.getLogger("ram_tagger")
+log = get_logger("ram")
 
 _MAPPING_PATH = Path(__file__).parent / "data" / "ram_tag_mapping.yaml"
 

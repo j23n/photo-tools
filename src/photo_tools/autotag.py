@@ -43,6 +43,14 @@ from photo_tools.helpers import (
     remove_tags,
     write_metadata,
 )
+from photo_tools import tui
+from photo_tools.logging_setup import (
+    PhotoSummary,
+    get_counter,
+    get_logger,
+    log_run_summary,
+    timed_step,
+)
 
 try:
     from titlecase import titlecase as _titlecase
@@ -55,7 +63,14 @@ def title(s: str) -> str:
     """Titlecase a path segment (geocoder value, tag leaf)."""
     return _titlecase(s.strip())
 
-log = logging.getLogger("autotag")
+
+# Subsystem loggers. The orchestrator owns ``tagging``; pipeline-specific
+# code (geocoding, gps, ocr) gets its own child so users can silence or
+# amplify each from --log.
+log = get_logger("tagging")
+log_gps = get_logger("gps")
+log_geo = get_logger("geocoding")
+log_ocr = get_logger("ocr")
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +201,12 @@ def build_gps_timeline(paths: list[Path]) -> dict[Path, tuple[float, float]]:
                     best_coords = gps_coords[candidate_idx]
         if best_coords and best_dist <= max_gap:
             result[p] = best_coords
-            log.debug("Inferred GPS for %s from nearby image (%.0fs away)",
-                      p.name, best_dist)
+            log_gps.debug("Inferred GPS for %s from nearby image (%.0fs away)",
+                          p.name, best_dist)
 
     inferred = sum(1 for p, _, c in gps_data if c is None and p in result)
     if inferred:
-        log.info("Inferred GPS for %d image(s) from nearby timestamps", inferred)
+        log_gps.info("Inferred GPS for %d image(s) from nearby timestamps", inferred)
 
     return result
 
@@ -199,15 +214,22 @@ def build_gps_timeline(paths: list[Path]) -> dict[Path, tuple[float, float]]:
 def reverse_geocode(lat: float, lon: float) -> dict:
     from photo_tools.landmarks import _haversine_km
     cfg = get_config()
+    counter = get_counter("geocoding")
 
     for clat, clon, addr in _geocode_cache:
         if _haversine_km(lat, lon, clat, clon) < cfg.gps.geocode_cache_radius_km:
+            counter.add("cache_hits")
             return addr
 
+    counter.add("queries")
     global _last_nominatim_call
     elapsed = time.time() - _last_nominatim_call
     if elapsed < 1.1:
-        time.sleep(1.1 - elapsed)
+        wait = 1.1 - elapsed
+        counter.add("rate_limit_waits")
+        counter.add("rate_limit_seconds", wait)
+        log_geo.debug("rate-limit cooldown %.1fs", wait)
+        time.sleep(wait)
     try:
         resp = requests.get(
             "https://nominatim.openstreetmap.org/reverse",
@@ -221,7 +243,8 @@ def reverse_geocode(lat: float, lon: float) -> dict:
         resp.raise_for_status()
         addr = resp.json().get("address", {})
     except Exception as e:
-        log.warning("Geocoding failed for (%.4f, %.4f): %s", lat, lon, e)
+        log_geo.warning("Nominatim failed for (%.4f, %.4f): %s", lat, lon, e)
+        counter.add("query_errors")
         _last_nominatim_call = time.time()
         return {}
     _geocode_cache.append((lat, lon, addr))
@@ -240,7 +263,7 @@ def tags_from_gps(exif: dict) -> tuple[list[str], str | None]:
     if coords is None:
         return [], None
     lat, lon = coords
-    log.debug("GPS: %.5f, %.5f", lat, lon)
+    log_geo.debug("lookup (%.5f, %.5f)", lat, lon)
     address = reverse_geocode(lat, lon)
     if not address:
         return [], None
@@ -330,7 +353,7 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
         ocr = _get_ocr_engine()
         results = ocr.predict(str(ocr_path))
     except Exception as e:
-        log.warning("PaddleOCR error on %s: %s", path.name, e)
+        log_ocr.warning("PaddleOCR error on %s: %s", path.name, e)
         return [], []
     finally:
         if prepared:
@@ -388,7 +411,7 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
                 break
 
     if tags:
-        log.debug("  OCR found %d text fragments in %s", len(tags), path.name)
+        log_ocr.debug("found %d text fragment(s) in %s", len(tags), path.name)
 
     return tags, regions
 
@@ -455,6 +478,8 @@ def process_single(
     bypass_version_check: bool = False,
 ) -> bool:
     cfg = get_config()
+    summary = PhotoSummary()
+    photo_t0 = time.perf_counter()
 
     if is_live_photo_motion(path):
         log.info("Skipping %s (Live Photo motion companion)", path.name)
@@ -499,45 +524,76 @@ def process_single(
 
     visual_path = frame_path if video else path
 
+    # ----- GPS reverse-geocoding ------------------------------------------
     places: list[str] = []
     country_code: str | None = None
     if enable_gps:
-        places, country_code = tags_from_gps(exif)
-        if places:
-            log.debug("  Geo:  %s", places)
-            all_tags.extend(places)
+        with timed_step("geocoding", photo=path.name, catch=True) as s:
+            s.ran = True
+            places, country_code = tags_from_gps(exif)
+            s.ok = True
+            if places:
+                log_geo.info("%s → %s", path.name, places[0])
+                all_tags.extend(places)
+            else:
+                log_geo.debug("%s: no place tags", path.name)
+        summary.record("gps", s.ran, s.ok)
+    else:
+        summary.skip("gps")
 
+    # ----- OCR ------------------------------------------------------------
     ocr_phrases: list[str] = []
     ocr_regions: list[dict] = []
     if enable_ocr and visual_path:
-        ocr_phrases, ocr_regions = tags_from_ocr(visual_path)
-        if ocr_phrases:
-            log.debug("  OCR:  %s", ocr_phrases)
+        with timed_step("ocr", photo=path.name, catch=True) as s:
+            s.ran = True
+            ocr_phrases, ocr_regions = tags_from_ocr(visual_path)
+            s.ok = True
+            get_counter("ocr").add("text_regions", len(ocr_regions))
+            if ocr_phrases:
+                log_ocr.info("%s: %d region(s) — %s",
+                             path.name, len(ocr_regions),
+                             ", ".join(ocr_phrases[:3])
+                             + (" …" if len(ocr_phrases) > 3 else ""))
+            else:
+                log_ocr.debug("%s: no text", path.name)
+        summary.record("ocr", s.ran, s.ok)
+    else:
+        summary.skip("ocr")
 
     embedding = None
     need_visual = (enable_ram or enable_landmarks) and visual_path
     prepared = prepare_image(visual_path, cfg.clip.max_pixels) if need_visual else None
     visual_input = prepared or visual_path
 
+    # ----- RAM++ ---------------------------------------------------------
     if enable_ram and visual_path:
-        try:
+        with timed_step("ram", photo=path.name, catch=True) as s:
+            s.ran = True
             tagger = _get_ram_tagger()
             ram_tags, scored_ram_tags = tagger.tag_image(visual_input)
+            s.ok = True
+            get_counter("ram").add("tags_emitted", len(ram_tags))
             if scored_ram_tags:
-                log.info("  RAM++ top 5: %s",
-                         ", ".join(f"{t} ({s:.3f}/thr {thr:.3f})"
-                                   for t, s, thr in scored_ram_tags[:5]))
-            log.debug("  RAM++: %s", ram_tags)
+                log_ram = get_logger("ram")
+                log_ram.info(
+                    "%s: top 5 — %s", path.name,
+                    ", ".join(f"{t} ({sc:.3f}/thr {thr:.3f})"
+                              for t, sc, thr in scored_ram_tags[:5]),
+                )
+                log_ram.debug("%s: all tags %s", path.name, ram_tags)
             all_tags.extend(ram_tags)
-        except Exception as e:
-            log.warning("RAM++ tagging failed for %s: %s", path.name, e)
+        summary.record("ram", s.ran, s.ok)
+    else:
+        summary.skip("ram")
 
+    # ----- CLIP embedding (used by RAM++ pipeline + landmark lookup) -----
     if (enable_ram or enable_landmarks) and visual_path:
-        try:
+        with timed_step("clip", photo=path.name, catch=True) as s:
+            s.ran = True
             embedder = _get_clip_embedder(clip_model, clip_pretrained)
             embedding = embedder.embed_image(visual_input)
-        except Exception as e:
-            log.warning("CLIP embedding failed for %s: %s", path.name, e)
+            s.ok = True
 
     if prepared:
         try:
@@ -545,24 +601,45 @@ def process_single(
         except OSError:
             pass
 
+    # ----- Landmarks -----------------------------------------------------
+    landmark_ran = False
+    landmark_ok = False
     if enable_landmarks and embedding is not None:
         coords = get_gps_coords(exif) or gps_fallback
         if coords is not None:
             lat, lon = coords
-            try:
+            with timed_step("landmarks", photo=path.name, catch=True) as s:
                 lm_index = _get_landmark_index(landmarks_path)
                 if lm_index is not None:
+                    s.ran = True
+                    landmark_ran = True
                     landmark, lm_top, lm_thr = lm_index.lookup(
                         embedding, lat=lat, lon=lon)
-                    if lm_top:
-                        log.info("  Landmarks top 3 (thr %.3f): %s", lm_thr,
-                                 ", ".join(f"{n} ({s:.3f})" for n, s in lm_top[:3]))
+                    s.ok = True
+                    landmark_ok = True
                     if landmark:
-                        tag = f"Landmarks/{title(landmark)}"
-                        log.debug("  Landmark: %s", tag)
-                        all_tags.append(tag)
-            except Exception as e:
-                log.debug("Landmark lookup failed: %s", e)
+                        get_counter("landmarks").add("matched")
+                        log_lm = get_logger("landmarks")
+                        log_lm.info("%s → %s (thr %.3f)",
+                                    path.name, landmark, lm_thr)
+                        if lm_top:
+                            log_lm.debug(
+                                "%s: top 3 — %s", path.name,
+                                ", ".join(f"{n} ({sc:.3f})"
+                                          for n, sc in lm_top[:3]),
+                            )
+                        all_tags.append(f"Landmarks/{title(landmark)}")
+                    else:
+                        get_counter("landmarks").add("no_match")
+                        log_lm = get_logger("landmarks")
+                        log_lm.debug(
+                            "%s: no match (thr %.3f, top %s)", path.name, lm_thr,
+                            [(n, f"{sc:.3f}") for n, sc in lm_top[:3]] if lm_top else [],
+                        )
+    if landmark_ran:
+        summary.record("landmarks", True, landmark_ok)
+    else:
+        summary.skip("landmarks")
 
     if frame_path:
         try:
@@ -585,7 +662,7 @@ def process_single(
         existing_non_ocr_regions(exif) if ocr_regions else None
     )
 
-    return write_metadata(
+    result = write_metadata(
         path,
         new_keywords=new_tags,
         namespace_fields=namespace_fields,
@@ -599,6 +676,10 @@ def process_single(
         stamp_ocr_ran=bool(enable_ocr and visual_path),
         dry_run=dry_run,
     )
+
+    elapsed = time.perf_counter() - photo_t0
+    log.info("%s done in %.1fs  %s", path.name, elapsed, summary.render())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -812,27 +893,34 @@ def run_tag(args) -> None:
 
     success = failed = 0
 
-    for i, img in enumerate(images, 1):
-        log.info("[%d/%d] %s", i, len(images), img)
-        try:
-            result = process_single(img, args.dry_run, args.force,
-                                    clear_all=args.clear_all,
-                                    enable_ram=enable_ram,
-                                    enable_landmarks=enable_landmarks,
-                                    enable_ocr=enable_ocr,
-                                    clip_model=args.clip_model,
-                                    clip_pretrained=args.clip_pretrained,
-                                    landmarks_path=args.landmarks_db,
-                                    gps_fallback=gps_timeline.get(img))
-            if result:
-                success += 1
-            else:
-                skipped += 1
-        except Exception as e:
-            log.error("Error processing %s: %s", img.name, e)
-            failed += 1
+    tui.start(total=len(images), header="tag run",
+              enabled=not getattr(args, "no_tui", False))
+    try:
+        for i, img in enumerate(images, 1):
+            tui.set_photo(i, img.name)
+            log.info("[%d/%d] %s", i, len(images), img)
+            try:
+                result = process_single(img, args.dry_run, args.force,
+                                        clear_all=args.clear_all,
+                                        enable_ram=enable_ram,
+                                        enable_landmarks=enable_landmarks,
+                                        enable_ocr=enable_ocr,
+                                        clip_model=args.clip_model,
+                                        clip_pretrained=args.clip_pretrained,
+                                        landmarks_path=args.landmarks_db,
+                                        gps_fallback=gps_timeline.get(img))
+                if result:
+                    success += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                log.error("Error processing %s: %s", img.name, e)
+                failed += 1
+    finally:
+        tui.stop()
 
     log.info("Done. %d tagged, %d skipped, %d failed.", success, skipped, failed)
+    log_run_summary()
 
 
 # ---------------------------------------------------------------------------
@@ -1005,29 +1093,37 @@ def run_tag_fix(args) -> None:
              counts["gps"], counts["ram"], counts["landmarks"], counts["ocr"])
 
     success = failed = 0
-    for i, (img, (run_gps, run_ram, run_lm, run_ocr)) in enumerate(needs_work, 1):
-        log.info("[%d/%d] %s  (gps=%s ram=%s landmarks=%s ocr=%s)",
-                 i, len(needs_work), img,
-                 run_gps, run_ram, run_lm, run_ocr)
-        try:
-            ok = process_single(
-                img, args.dry_run, force=False,
-                clear_all=False,
-                enable_ram=run_ram,
-                enable_landmarks=run_lm,
-                enable_ocr=run_ocr,
-                enable_gps=run_gps,
-                clip_model=args.clip_model,
-                clip_pretrained=args.clip_pretrained,
-                landmarks_path=args.landmarks_db,
-                gps_fallback=gps_timeline.get(img),
-                bypass_version_check=True,
-            )
-            if ok:
-                success += 1
-        except Exception as e:
-            log.error("Error fixing %s: %s", img.name, e)
-            failed += 1
+    tui.start(total=len(needs_work), header="tag fix",
+              workload=counts,
+              enabled=not getattr(args, "no_tui", False))
+    try:
+        for i, (img, (run_gps, run_ram, run_lm, run_ocr)) in enumerate(needs_work, 1):
+            tui.set_photo(i, img.name)
+            log.info("[%d/%d] %s  (gps=%s ram=%s landmarks=%s ocr=%s)",
+                     i, len(needs_work), img,
+                     run_gps, run_ram, run_lm, run_ocr)
+            try:
+                ok = process_single(
+                    img, args.dry_run, force=False,
+                    clear_all=False,
+                    enable_ram=run_ram,
+                    enable_landmarks=run_lm,
+                    enable_ocr=run_ocr,
+                    enable_gps=run_gps,
+                    clip_model=args.clip_model,
+                    clip_pretrained=args.clip_pretrained,
+                    landmarks_path=args.landmarks_db,
+                    gps_fallback=gps_timeline.get(img),
+                    bypass_version_check=True,
+                )
+                if ok:
+                    success += 1
+            except Exception as e:
+                log.error("Error fixing %s: %s", img.name, e)
+                failed += 1
+    finally:
+        tui.stop()
 
     log.info("Done. %d fixed, %d already-complete, %d failed.",
              success, already_complete, failed)
+    log_run_summary()

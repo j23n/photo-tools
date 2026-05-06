@@ -6,15 +6,15 @@ fast cosine-similarity search filtered by GPS radius.
 """
 
 import json
-import logging
 import math
 from pathlib import Path
 
 import numpy as np
 
 from photo_tools.config import get_config
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("landmarks")
+log = get_logger("landmarks")
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

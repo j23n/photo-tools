@@ -17,7 +17,19 @@ def main():
 
     parser = argparse.ArgumentParser(prog="photo-tools")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable verbose (debug) logging")
+                        help="Enable verbose (debug) logging for all subsystems")
+    parser.add_argument(
+        "--log", dest="log_spec", default=None,
+        metavar="SPEC",
+        help="Per-subsystem log levels, e.g. "
+             "'ocr=debug,ram=warning,geocoding=info'. "
+             "Subsystems: tagging, geocoding, gps, ocr, ram, clip, "
+             "landmarks, exif, dates, duplicates. "
+             "Also reads PHOTOTOOLS_LOG env var.",
+    )
+    parser.add_argument("--no-tui", dest="no_tui", action="store_true",
+                        help="Disable the live status panel (auto-disabled "
+                             "when stderr is not a TTY)")
     parser.add_argument("--config", type=Path, default=None,
                         help="Path to user config YAML overlay")
 
@@ -36,6 +48,6 @@ def main():
     build_landmarks_parser(sub)
 
     args = parser.parse_args()
-    setup_logging(verbose=args.verbose)
+    setup_logging(verbose=args.verbose, log_spec=args.log_spec)
     load_config(user_config_path=args.config)
     args.func(args)

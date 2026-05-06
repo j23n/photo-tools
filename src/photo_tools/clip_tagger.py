@@ -6,14 +6,14 @@ by RAM++ (see ram_tagger.py); this module is only used for embedding-based
 tasks like landmark lookup, duplicate detection, and "find similar".
 """
 
-import logging
 from pathlib import Path
 
 import numpy as np
 
 from photo_tools.config import get_config
+from photo_tools.logging_setup import get_logger
 
-log = logging.getLogger("clip_tagger")
+log = get_logger("clip")
 
 
 class CLIPEmbedder:
