@@ -669,34 +669,60 @@ def _save(output_path: Path, model: str, pretrained: str, landmarks: list[dict])
 # ---------------------------------------------------------------------------
 
 def build_landmarks_parser(subparsers):
-    """Register the 'build-landmarks' subcommand."""
-    sub = subparsers.add_parser(
-        "build-landmarks",
+    """Register the 'landmarks' subcommand group with generate-db + query."""
+    lm_parser = subparsers.add_parser(
+        "landmarks",
+        help="Landmark database tools: build the DB, or query an image against it.",
+    )
+    lm_sub = lm_parser.add_subparsers(dest="landmarks_command", required=True)
+
+    gen = lm_sub.add_parser(
+        "generate-db",
         help="Build CLIP embedding database of notable landmarks from Wikidata.",
     )
-    sub.add_argument("-o", "--output", type=Path,
+    gen.add_argument("-o", "--output", type=Path,
                      default=Path.home() / ".local/share/photo-tools/landmarks.json",
                      help="Output path for landmarks.json")
-    sub.add_argument("-l", "--limit", type=int, default=20000,
+    gen.add_argument("-l", "--limit", type=int, default=20000,
                      help="Max landmarks to fetch from Wikidata (default: 20000)")
-    sub.add_argument("--clip-model", default=None,
+    gen.add_argument("--clip-model", default=None,
                      help="CLIP model name (default: from config)")
-    sub.add_argument("--clip-pretrained", default=None,
+    gen.add_argument("--clip-pretrained", default=None,
                      help="CLIP pretrained weights (default: from config)")
-    sub.add_argument("--resume", action="store_true",
+    gen.add_argument("--resume", action="store_true",
                      help="Skip landmarks already in output file")
-    sub.add_argument("--wikidata-cache", type=Path, metavar="PATH",
+    gen.add_argument("--wikidata-cache", type=Path, metavar="PATH",
                      help="Load landmarks from a previous .wikidata.json instead of querying")
-    sub.add_argument("--test", action="store_true",
+    gen.add_argument("--test", action="store_true",
                      help="Build a small database (~200 landmarks in Rome and Bologna)")
-    sub.add_argument("--images-per-landmark", type=int, default=None,
+    gen.add_argument("--images-per-landmark", type=int, default=None,
                      help="Target number of images per landmark (default: from config)")
-    sub.set_defaults(func=run_build_landmarks)
-    return sub
+    gen.set_defaults(func=run_generate_db)
+
+    q = lm_sub.add_parser(
+        "query",
+        help="Query the landmark DB with an image and print the top matches.",
+    )
+    q.add_argument("image", type=Path, help="Path to an image to query")
+    q.add_argument("-k", "--top-k", type=int, default=10,
+                   help="Number of top matches to print (default: 10)")
+    q.add_argument("--landmarks-db", type=Path, default=None, dest="landmarks_db",
+                   help="Path to landmarks.json (default: from config)")
+    q.add_argument("--clip-model", default=None,
+                   help="CLIP model name (default: from config)")
+    q.add_argument("--clip-pretrained", default=None,
+                   help="CLIP pretrained weights (default: from config)")
+    q.add_argument("--radius-km", type=float, default=None,
+                   help="GPS radius filter (default: from config; ignored if image has no GPS)")
+    q.add_argument("--no-gps", action="store_true",
+                   help="Ignore image GPS and search globally (useful for debugging)")
+    q.set_defaults(func=run_query)
+
+    return lm_parser
 
 
-def run_build_landmarks(args) -> None:
-    """Execute the build-landmarks subcommand."""
+def run_generate_db(args) -> None:
+    """Execute the landmarks generate-db subcommand."""
     cfg = get_config()
     build_database(
         limit=args.limit,
@@ -708,3 +734,81 @@ def run_build_landmarks(args) -> None:
         test=args.test,
         images_per_landmark=args.images_per_landmark,
     )
+
+
+def run_query(args) -> None:
+    """Embed an image, then print the top-K nearest landmarks from the DB."""
+    import os as _os
+
+    from photo_tools.autotag import get_gps_coords
+    from photo_tools.clip_tagger import CLIPEmbedder
+    from photo_tools.helpers import prepare_image, read_exif
+    from photo_tools.landmarks import LandmarkIndex, _haversine_km
+
+    cfg = get_config()
+    image = args.image
+    if not image.is_file():
+        log.error("Image not found: %s", image)
+        sys.exit(1)
+
+    lm_path = args.landmarks_db or Path(cfg.landmarks.default_path).expanduser()
+    if not lm_path.exists():
+        log.error("Landmarks DB not found at %s", lm_path)
+        sys.exit(1)
+
+    clip_model = args.clip_model or cfg.clip.model
+    clip_pretrained = args.clip_pretrained or cfg.clip.pretrained
+    embedder = CLIPEmbedder(model_name=clip_model, pretrained=clip_pretrained)
+
+    index = LandmarkIndex(lm_path)
+    if index.model_id != f"{clip_model}/{clip_pretrained}":
+        log.warning("DB built with %s but querying with %s/%s — results may be poor",
+                    index.model_id, clip_model, clip_pretrained)
+
+    prepared = prepare_image(image, cfg.clip.max_pixels)
+    visual_input = prepared or image
+    try:
+        embedding = embedder.embed_image(visual_input)
+    finally:
+        if prepared:
+            try:
+                _os.unlink(prepared)
+            except OSError:
+                pass
+
+    coords = None if args.no_gps else get_gps_coords(read_exif(image))
+
+    if coords is not None and not args.no_gps:
+        radius_km = args.radius_km if args.radius_km is not None else cfg.landmarks.radius_km
+        lat, lon = coords
+        log.info("Image GPS: %.5f, %.5f  — searching within %.0f km", lat, lon, radius_km)
+        _, top, threshold = index.lookup(
+            embedding, lat=lat, lon=lon,
+            radius_km=radius_km, threshold=cfg.landmarks.threshold,
+        )
+        if not top:
+            print(f"No landmarks within {radius_km:.0f} km of the image.")
+            return
+        print(f"Top {min(args.top_k, len(top))} matches "
+              f"(threshold {threshold:.3f}):")
+        for name, score in top[:args.top_k]:
+            mark = " *" if score >= threshold else "  "
+            print(f"  {mark} {score:.3f}  {name}")
+    else:
+        # Global search: cosine similarity against every landmark, no FAISS shortcut
+        # because we want a single global ranking.
+        import numpy as _np
+        scores = index._embeddings @ embedding.astype(_np.float32)
+        order = _np.argsort(-scores)[:args.top_k]
+        threshold = cfg.landmarks.threshold
+        print(f"Global top {len(order)} (no GPS filter, threshold {threshold:.3f}):")
+        for i in order:
+            name = index.names[i]
+            s = float(scores[i])
+            dist = ""
+            if coords is not None:
+                dist_km = _haversine_km(coords[0], coords[1],
+                                        index.lats[i], index.lons[i])
+                dist = f"  ({dist_km:.0f} km away)"
+            mark = " *" if s >= threshold else "  "
+            print(f"  {mark} {s:.3f}  {name}{dist}")

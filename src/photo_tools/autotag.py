@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -315,7 +315,12 @@ def _get_image_dimensions(path) -> tuple[int | None, int | None]:
 
 
 def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
-    """Run PaddleOCR and return (text_tags, regions)."""
+    """Run PaddleOCR and return (phrases, regions).
+
+    Phrases are titlecased strings (no tag-root prefix). They are stored in
+    ``XMP-phototools:OCRText`` and IPTC ImageRegion metadata — not as keyword
+    tags — so they don't pollute the digiKam tag tree.
+    """
     cfg = get_config()
     prepared = prepare_image(path, cfg.ocr.max_pixels)
     ocr_path = prepared or path
@@ -368,7 +373,7 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
             if phrase_key in seen:
                 continue
             seen.add(phrase_key)
-            tags.append(f"Text/{title(phrase)}")
+            tags.append(title(phrase))
 
             poly_arr = np.array(poly)
             x_min, y_min = poly_arr.min(axis=0)
@@ -424,8 +429,16 @@ def _read_existing_regions(path: Path) -> tuple[list[dict], list[dict], dict | N
     return existing_mwg, existing_iptc, applied_dims
 
 
-def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -> bool:
-    """Write OCR text regions as IPTC ImageRegion + MWG Region metadata."""
+def write_text_regions(
+    path: Path,
+    phrases: list[str],
+    regions: list[dict],
+    dry_run: bool = False,
+) -> bool:
+    """Write OCR text as XMP-phototools:OCRText + IPTC ImageRegion + MWG Region.
+
+    Caller is responsible for writing the XMP-phototools:OCRRan marker —
+    this function is a no-op when there are no regions to write."""
     if not regions:
         return True
     if dry_run:
@@ -466,6 +479,7 @@ def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -
 
     meta = {
         "SourceFile": str(path),
+        "XMP-phototools:OCRText": phrases,
         "XMP-iptcExt:ImageRegion": iptc_regions,
         "XMP-mwg-rs:RegionInfo": mwg_info,
     }
@@ -476,7 +490,7 @@ def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -
         tmp.close()
         result = _run_exiftool(
             ["-overwrite_original", "-struct", f"-json={tmp.name}", str(path)],
-            with_config=False, timeout=60,
+            with_config=True, timeout=60,
         )
         if result.returncode != 0:
             log.error("exiftool region write failed for %s: %s", path.name, result.stderr.strip())
@@ -491,6 +505,20 @@ def write_text_regions(path: Path, regions: list[dict], dry_run: bool = False) -
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+def write_ocr_ran(path: Path, dry_run: bool = False) -> None:
+    """Stamp XMP-phototools:OCRRan with the current UTC timestamp."""
+    if dry_run:
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    result = _run_exiftool(
+        ["-overwrite_original", f"-XMP-phototools:OCRRan={ts}", str(path)],
+        with_config=True, timeout=30,
+    )
+    if result.returncode != 0:
+        log.warning("Failed to write OCRRan marker for %s: %s",
+                    path.name, result.stderr.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -547,10 +575,12 @@ def process_single(
     enable_ram: bool = True,
     enable_landmarks: bool = True,
     enable_ocr: bool = True,
+    enable_gps: bool = True,
     clip_model: str = None,
     clip_pretrained: str = None,
     landmarks_path: Path = None,
     gps_fallback: tuple[float, float] | None = None,
+    bypass_version_check: bool = False,
 ) -> bool:
     cfg = get_config()
 
@@ -570,7 +600,8 @@ def process_single(
     existing = get_existing_keywords(exif)
     stored_version = get_tagger_version(exif)
 
-    if (stored_version == TAGGER_VERSION and not force and not clear_all):
+    if (stored_version == TAGGER_VERSION and not force and not clear_all
+            and not bypass_version_check):
         log.info("Skipping %s (already tagged with %s, use --force to re-tag)",
                  path.name, stored_version)
         return False
@@ -596,17 +627,20 @@ def process_single(
 
     visual_path = frame_path if video else path
 
-    places, country_code = tags_from_gps(exif)
-    if places:
-        log.debug("  Geo:  %s", places)
-        all_tags.extend(places)
+    places: list[str] = []
+    country_code: str | None = None
+    if enable_gps:
+        places, country_code = tags_from_gps(exif)
+        if places:
+            log.debug("  Geo:  %s", places)
+            all_tags.extend(places)
 
-    ocr_regions = []
+    ocr_phrases: list[str] = []
+    ocr_regions: list[dict] = []
     if enable_ocr and visual_path:
-        t, ocr_regions = tags_from_ocr(visual_path)
-        if t:
-            log.debug("  OCR:  %s", t)
-            all_tags.extend(t)
+        ocr_phrases, ocr_regions = tags_from_ocr(visual_path)
+        if ocr_phrases:
+            log.debug("  OCR:  %s", ocr_phrases)
 
     embedding = None
     need_visual = (enable_ram or enable_landmarks) and visual_path
@@ -674,10 +708,16 @@ def process_single(
     ok = True
     if new_tags or namespace_fields or stored_version != TAGGER_VERSION:
         ok = add_tags(path, new_tags, dry_run, namespace_fields=namespace_fields)
-        if ok and ocr_regions:
-            write_text_regions(path, ocr_regions, dry_run)
     else:
         log.info("No new keywords for %s", path.name)
+
+    if ok and ocr_regions:
+        write_text_regions(path, ocr_phrases, ocr_regions, dry_run)
+
+    # Stamp OCRRan whenever the OCR pipeline ran for this photo, so a future
+    # `tag fix` knows OCR has been considered (even when nothing was detected).
+    if ok and enable_ocr and visual_path:
+        write_ocr_ran(path, dry_run)
 
     # Write embedding last — after all other exiftool calls that rewrite XMP.
     if embedding is not None and not dry_run:
@@ -766,14 +806,59 @@ def _add_tag_args(parser: argparse.ArgumentParser) -> None:
                         help="Path to landmarks.json")
 
 
-def build_tag_parser(subparsers) -> argparse.ArgumentParser:
-    sub = subparsers.add_parser(
-        "tag",
-        help="Auto-tag photos using RAM++, landmark lookup, OCR, GPS geocoding, and EXIF metadata.",
+def _add_tag_fix_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", type=Path, nargs="+",
+                        help="Image file(s) or directory (one or more)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Preview without writing")
+
+    pipelines = parser.add_argument_group(
+        "pipeline selection",
+        "Limit which pipelines `fix` is allowed to consider. "
+        "When none are specified, all pipelines are considered. "
+        "A pipeline only runs on photos where its output is missing."
     )
-    _add_tag_args(sub)
-    sub.set_defaults(func=run_tag)
-    return sub
+    pipelines.add_argument("--gps", action="store_true",
+                           help="Consider GPS reverse geocoding")
+    pipelines.add_argument("--ram", action="store_true",
+                           help="Consider RAM++ tags")
+    pipelines.add_argument("--landmarks", action="store_true",
+                           help="Consider landmark lookup")
+    pipelines.add_argument("--ocr", action="store_true",
+                           help="Consider OCR text detection")
+
+    parser.add_argument("--clip-model", default=None,
+                        help="CLIP model name (default: from config)")
+    parser.add_argument("--clip-pretrained", default=None,
+                        help="CLIP pretrained weights (default: from config)")
+    parser.add_argument("--landmarks-db", type=Path, default=None,
+                        dest="landmarks_db",
+                        help="Path to landmarks.json")
+
+
+def build_tag_parser(subparsers) -> argparse.ArgumentParser:
+    tag_parser = subparsers.add_parser(
+        "tag",
+        help="Auto-tag photos (RAM++, landmarks, OCR, GPS, EXIF).",
+    )
+    tag_sub = tag_parser.add_subparsers(dest="tag_command", required=True)
+
+    run_p = tag_sub.add_parser(
+        "run",
+        help="Tag photos. Skips photos already at the current TaggerVersion.",
+    )
+    _add_tag_args(run_p)
+    run_p.set_defaults(func=run_tag)
+
+    fix_p = tag_sub.add_parser(
+        "fix",
+        help="Fill in missing pipeline outputs per-photo (geocoding, RAM++, "
+             "landmarks, OCR). Detects what's missing from existing metadata.",
+    )
+    _add_tag_fix_args(fix_p)
+    fix_p.set_defaults(func=run_tag_fix)
+
+    return tag_parser
 
 
 def run_tag(args) -> None:
@@ -874,3 +959,201 @@ def run_tag(args) -> None:
             failed += 1
 
     log.info("Done. %d tagged, %d skipped, %d failed.", success, skipped, failed)
+
+
+# ---------------------------------------------------------------------------
+# tag fix — per-pipeline missing-output detection
+# ---------------------------------------------------------------------------
+
+def _read_fix_metadata_batch(paths: list[Path]) -> dict[Path, dict]:
+    """Batch-read keywords + OCRRan + GPS coords for `tag fix` planning.
+
+    Returns {path: {"keywords": set[str], "ocr_ran": bool, "coords": tuple|None}}
+    where keywords are full hierarchical strings (Places/..., Objects/...).
+    """
+    if not paths:
+        return {}
+
+    cfg = get_config()
+    batch_size = cfg.exiftool.batch_size
+    total = len(paths)
+    n_batches = (total + batch_size - 1) // batch_size
+    result: dict[Path, dict] = {}
+
+    fields = [
+        "-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList",
+        "-XMP-phototools:OCRRan",
+        "-GPS:GPSLatitude", "-GPS:GPSLongitude",
+        "-GPS:GPSLatitudeRef", "-GPS:GPSLongitudeRef",
+        "-n",
+    ]
+
+    for batch_idx, i in enumerate(range(0, total, batch_size), 1):
+        batch = paths[i:i + batch_size]
+        log.info("Reading metadata batch %d/%d (%d files, %d/%d total)",
+                 batch_idx, n_batches, len(batch),
+                 min(i + len(batch), total), total)
+        meta_list = _run_exiftool_json(
+            fields + [str(p) for p in batch], timeout=120,
+        )
+        if not meta_list:
+            for p in batch:
+                result[p] = {"keywords": set(), "ocr_ran": False, "coords": None}
+            continue
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            kw = set()
+            for field in ("Keywords", "Subject", "TagsList"):
+                val = meta.get(field, [])
+                if isinstance(val, str):
+                    val = [val]
+                for v in val:
+                    kw.add(str(v))
+            result[path] = {
+                "keywords": kw,
+                "ocr_ran": bool(meta.get("OCRRan")),
+                "coords": get_gps_coords(meta),
+            }
+    return result
+
+
+def _has_keyword_with_prefix(keywords: set[str], prefix: str) -> bool:
+    """True if any keyword in the set begins with `prefix` (e.g. 'Places/')."""
+    return any(k.startswith(prefix) for k in keywords)
+
+
+def _decide_fix_pipelines(
+    meta: dict,
+    consider_gps: bool,
+    consider_ram: bool,
+    consider_landmarks: bool,
+    consider_ocr: bool,
+    landmarks_db_exists: bool,
+    gps_fallback: tuple[float, float] | None,
+) -> tuple[bool, bool, bool, bool]:
+    """Decide which pipelines should run for one photo.
+
+    Returns (run_gps, run_ram, run_landmarks, run_ocr).
+    """
+    keywords = meta["keywords"]
+    has_exif_coords = meta["coords"] is not None
+    has_any_coords = has_exif_coords or gps_fallback is not None
+
+    # Geocoding uses only EXIF coords — the GPS timeline fallback is consumed
+    # by the landmark pipeline only (see process_single).
+    run_gps = (consider_gps
+               and has_exif_coords
+               and not _has_keyword_with_prefix(keywords, "Places/"))
+
+    run_ram = (consider_ram
+               and not _has_keyword_with_prefix(keywords, "Objects/")
+               and not _has_keyword_with_prefix(keywords, "Scenes/"))
+
+    run_landmarks = (consider_landmarks
+                     and landmarks_db_exists
+                     and has_any_coords
+                     and not _has_keyword_with_prefix(keywords, "Landmarks/"))
+
+    run_ocr = consider_ocr and not meta["ocr_ran"]
+
+    return run_gps, run_ram, run_landmarks, run_ocr
+
+
+def run_tag_fix(args) -> None:
+    cfg = get_config()
+
+    any_selected = args.gps or args.ram or args.landmarks or args.ocr
+    consider_gps = args.gps or not any_selected
+    consider_ram = args.ram or not any_selected
+    consider_landmarks = args.landmarks or not any_selected
+    consider_ocr = args.ocr or not any_selected
+
+    lm_path = args.landmarks_db or Path(cfg.landmarks.default_path).expanduser()
+    landmarks_db_exists = lm_path.exists()
+    if consider_landmarks and not landmarks_db_exists:
+        log.warning("Landmarks DB not found at %s — landmark fixes will be skipped",
+                    lm_path)
+
+    images: list[Path] = []
+    seen: set[Path] = set()
+    for p in args.path:
+        for img in find_images(p):
+            resolved = img.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                images.append(img)
+    if not images:
+        log.error("No supported images found at %s",
+                  ", ".join(str(p) for p in args.path))
+        sys.exit(1)
+
+    motion_companions = [p for p in images if is_live_photo_motion(p)]
+    if motion_companions:
+        log.info("Skipping %d Live Photo motion companion(s)", len(motion_companions))
+        images = [p for p in images if not is_live_photo_motion(p)]
+
+    if not images:
+        log.info("Done. 0 fixed, 0 already-complete, 0 failed.")
+        return
+
+    log.info("Considering %d image(s) for fixing", len(images))
+
+    metadata = _read_fix_metadata_batch(images)
+    gps_timeline = build_gps_timeline(images) if consider_landmarks else {}
+
+    plans: list[tuple[Path, tuple[bool, bool, bool, bool]]] = []
+    for img in images:
+        meta = metadata.get(img, {"keywords": set(), "ocr_ran": False, "coords": None})
+        plan = _decide_fix_pipelines(
+            meta, consider_gps, consider_ram, consider_landmarks, consider_ocr,
+            landmarks_db_exists, gps_timeline.get(img),
+        )
+        plans.append((img, plan))
+
+    needs_work = [(p, plan) for p, plan in plans if any(plan)]
+    already_complete = len(plans) - len(needs_work)
+    log.info("Plan: %d need work, %d already complete",
+             len(needs_work), already_complete)
+
+    if not needs_work:
+        log.info("Done. 0 fixed, %d already-complete, 0 failed.", already_complete)
+        return
+
+    counts = {"gps": 0, "ram": 0, "landmarks": 0, "ocr": 0}
+    for _, (g, r, lm, o) in needs_work:
+        if g: counts["gps"] += 1
+        if r: counts["ram"] += 1
+        if lm: counts["landmarks"] += 1
+        if o: counts["ocr"] += 1
+    log.info("Pipeline workload: GPS=%d, RAM++=%d, Landmarks=%d, OCR=%d",
+             counts["gps"], counts["ram"], counts["landmarks"], counts["ocr"])
+
+    success = failed = 0
+    for i, (img, (run_gps, run_ram, run_lm, run_ocr)) in enumerate(needs_work, 1):
+        log.info("[%d/%d] %s  (gps=%s ram=%s landmarks=%s ocr=%s)",
+                 i, len(needs_work), img,
+                 run_gps, run_ram, run_lm, run_ocr)
+        try:
+            ok = process_single(
+                img, args.dry_run, force=False,
+                clear_all=False,
+                enable_ram=run_ram,
+                enable_landmarks=run_lm,
+                enable_ocr=run_ocr,
+                enable_gps=run_gps,
+                clip_model=args.clip_model,
+                clip_pretrained=args.clip_pretrained,
+                landmarks_path=args.landmarks_db,
+                gps_fallback=gps_timeline.get(img),
+                bypass_version_check=True,
+            )
+            if ok:
+                success += 1
+        except Exception as e:
+            log.error("Error fixing %s: %s", img.name, e)
+            failed += 1
+
+    log.info("Done. %d fixed, %d already-complete, %d failed.",
+             success, already_complete, failed)

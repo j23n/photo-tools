@@ -17,7 +17,7 @@ import numpy as np
 
 from photo_tools.config import get_config
 from photo_tools.constants import (
-    ALL_OUR_ROOTS,
+    OUR_TAG_ROOTS,
     SUPPORTED_EXTENSIONS,
     TAGGER_VERSION,
     VIDEO_EXTENSIONS,
@@ -77,8 +77,8 @@ def _run_exiftool_json(
 # ---------------------------------------------------------------------------
 
 def is_our_tag(tag: str) -> bool:
-    """True if `tag` is in a root we own (Places/, Objects/, Scenes/, Text/)."""
-    return any(tag.startswith(root) for root in ALL_OUR_ROOTS)
+    """True if `tag` is in a root we own (Places/, Objects/, Scenes/, Landmarks/)."""
+    return any(tag.startswith(root) for root in OUR_TAG_ROOTS)
 
 
 def deduplicate(tags: list[str]) -> list[str]:
@@ -702,7 +702,7 @@ def extract_video_frame(path: Path) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# CLIP embedding cache (stored in XMP, reused by find-similar)
+# CLIP embedding cache (stored in XMP, reused by `duplicates`)
 # ---------------------------------------------------------------------------
 
 

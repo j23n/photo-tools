@@ -47,6 +47,8 @@ Namespace URI: **`https://github.com/j23n/photo-tools/ns/1.0/`**
 | `photo-tools:TaggerVersion` | string (`"YYYY.N"`) | Sentinel — presence means file was tagged by this tool. A mismatched value triggers re-tag on next run. |
 | `photo-tools:TaggedAt` | ISO 8601 timestamp | When the file was last tagged. |
 | `photo-tools:CountryCode` | ISO 3166-1 alpha-2 (uppercase, e.g. `IT`) | Country code from reverse geocoding. Kept out of the keyword space. |
+| `photo-tools:OCRText` | bag of strings | PaddleOCR detected text phrases (one entry per phrase). Stored here instead of as keyword tags to avoid polluting the digiKam tag tree. |
+| `photo-tools:OCRRan` | ISO 8601 timestamp | When the OCR pipeline last ran on this file. Distinct from `OCRText` because a deleted Bag is indistinguishable from never-written, so `tag fix` needs a separate marker to mean "ran, no text". |
 | `photo-tools:CLIPEmbedding` | base64 of float32 vector | Cached image embedding for similarity search. |
 | `photo-tools:CLIPModel` | string (e.g. `ViT-B-32/laion2b_s34b_b79k`) | Model identifier for the cached embedding. |
 
@@ -79,7 +81,6 @@ Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]
 Landmarks/<name>
 Objects/<TopLevel>/<SubCategory>/<Leaf>
 Scenes/<TopLevel>/<SubCategory>/<Leaf>
-Text/<phrase>
 ```
 
 Objects and Scenes use 2–3 path segments (leaf nodes may be 2 levels when
@@ -176,19 +177,22 @@ the reverse-geocoded Places path *and* the Landmarks tag; the former answers
 lookup requires GPS (from EXIF or an explicit fallback) and a built index;
 without either it is skipped silently.
 
-### 2.6 Text
+### 2.6 Text (OCR)
 
-Visible text detected by PaddleOCR. Each accepted phrase becomes a single
-flat segment:
+Visible text detected by PaddleOCR is **not** written as keyword tags.
+Instead it is stored in two places:
 
-```
-Text/Pizza
-Text/Caffè Centrale
-```
+1. **`photo-tools:OCRText`** — a bag of titlecased phrases in the custom
+   namespace (see §1.2). Searchable via exiftool:
+   ```
+   exiftool -if '$OCRText =~ /pizza/i' -OCRText FILE
+   ```
+2. **IPTC `ImageRegion`** / **MWG `RegionInfo`** — one entry per phrase with
+   bounding-box coordinates so consumers can locate the text in the image.
 
-OCR also writes IPTC `ImageRegion` entries for each detected phrase so
-consumers can locate the text in the image. Confidence and length filters
-are configured under `ocr.*` in `default_config.yaml`.
+This avoids polluting the digiKam tag tree with throwaway OCR phrases.
+Confidence and length filters are configured under `ocr.*` in
+`default_config.yaml`.
 
 ---
 
