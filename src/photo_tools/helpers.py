@@ -418,6 +418,99 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
     return result
 
 
+def read_dates_batch(paths: list[Path]) -> dict[Path, dict]:
+    """Read EXIF/QuickTime date fields from many files in batched exiftool calls.
+
+    Returns {path: {"DateTimeOriginal": str|None, "CreateDate": str|None}}.
+    Files absent from the returned dict had no readable metadata at all.
+    Used by `dates backfill` to detect which files are missing a date.
+    """
+    if not paths:
+        return {}
+
+    batch_size = get_config().exiftool.batch_size
+    result: dict[Path, dict] = {}
+
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i + batch_size]
+        meta_list = _run_exiftool_json(
+            ["-DateTimeOriginal", "-CreateDate"]
+            + [str(p) for p in batch],
+            with_config=False, timeout=120,
+        )
+        if not meta_list:
+            continue
+
+        str_to_path = {str(p): p for p in batch}
+        for meta in meta_list:
+            source = meta.get("SourceFile", "")
+            path = str_to_path.get(source, Path(source))
+            result[path] = {
+                "DateTimeOriginal": meta.get("DateTimeOriginal"),
+                "CreateDate": meta.get("CreateDate"),
+            }
+
+    return result
+
+
+def write_dates(
+    path: Path,
+    dt: datetime,
+    source: str,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Write DateTimeOriginal/CreateDate (and friends) to a single file.
+
+    Picks EXIF tags for images and QuickTime tags for videos, plus XMP
+    mirrors that survive container-agnostic round-trips. Records
+    `XMP-phototools:DateBackfilledFrom=<source>` so the write is auditable.
+    """
+    stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+    if dry_run:
+        log.info("[DRY RUN] Would set %s on %s (source: %s)",
+                 stamp, path.name, source)
+        return True
+
+    args = ["-overwrite_original"]
+    if is_video(path):
+        args += [
+            f"-QuickTime:CreateDate={stamp}",
+            f"-QuickTime:ModifyDate={stamp}",
+            f"-QuickTime:TrackCreateDate={stamp}",
+            f"-QuickTime:TrackModifyDate={stamp}",
+            f"-QuickTime:MediaCreateDate={stamp}",
+            f"-QuickTime:MediaModifyDate={stamp}",
+        ]
+    else:
+        args += [
+            f"-EXIF:DateTimeOriginal={stamp}",
+            f"-EXIF:CreateDate={stamp}",
+            f"-EXIF:ModifyDate={stamp}",
+            f"-XMP-photoshop:DateCreated={stamp}",
+        ]
+    args += [
+        f"-XMP-xmp:CreateDate={stamp}",
+        f"-XMP-phototools:DateBackfilledFrom={source}",
+        str(path),
+    ]
+
+    try:
+        result = _run_exiftool(args)
+        if result.returncode != 0:
+            log.error("exiftool failed for %s: %s",
+                      path.name, result.stderr.strip())
+            return False
+        log.debug("Wrote %s to %s (source: %s)", stamp, path.name, source)
+        return True
+    except FileNotFoundError:
+        log.error("exiftool not found. Install with: brew install exiftool")
+        sys.exit(1)
+    except Exception as e:
+        log.error("Failed to write date to %s: %s", path.name, e)
+        return False
+
+
 def read_tagger_versions_batch(paths: list[Path]) -> dict[Path, str]:
     """Read XMP-phototools:TaggerVersion from many files in batched exiftool calls.
 

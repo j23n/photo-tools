@@ -51,6 +51,7 @@ Namespace URI: **`https://github.com/j23n/photo-tools/ns/1.0/`**
 | `photo-tools:OCRRan` | ISO 8601 timestamp | When the OCR pipeline last ran on this file. Distinct from `OCRText` because a deleted Bag is indistinguishable from never-written, so `tag fix` needs a separate marker to mean "ran, no text". |
 | `photo-tools:CLIPEmbedding` | base64 of float32 vector | Cached image embedding for similarity search. |
 | `photo-tools:CLIPModel` | string (e.g. `ViT-B-32/laion2b_s34b_b79k`) | Model identifier for the cached embedding. |
+| `photo-tools:DateBackfilledFrom` | string (e.g. `filename:whatsapp`, `mtime`) | Provenance for `dates backfill` writes. Presence means `DateTimeOriginal` was reconstructed, not original. |
 
 ### 1.3 Fields photo-tools does not write
 

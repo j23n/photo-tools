@@ -25,11 +25,13 @@ def main():
 
     from photo_tools.autotag import build_tag_parser
     from photo_tools.build_landmarks import build_landmarks_parser
+    from photo_tools.dates_cmd import build_dates_parser
     from photo_tools.duplicates import build_duplicates_parser
     from photo_tools.tags_cmd import build_tags_parser
 
     build_tag_parser(sub)
     build_tags_parser(sub)
+    build_dates_parser(sub)
     build_duplicates_parser(sub)
     build_landmarks_parser(sub)
 
