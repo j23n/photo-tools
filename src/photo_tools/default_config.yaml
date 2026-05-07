@@ -32,6 +32,14 @@ exiftool:
   batch_size: 500
   timeout: 60
 
+xmp:
+  # When true, every metadata write goes to both the image and a sibling
+  # IMG_1234.jpg.xmp sidecar, and reads merge the two. When false (default),
+  # writes go to the image only and sidecars are ignored on read. Toggle
+  # per-invocation with --xmp-sidecars on the command line. See
+  # docs/xmp-schema.md §1.3.
+  sidecars: false
+
 image:
   jpeg_quality: 90
 

@@ -32,6 +32,11 @@ def main():
                              "when stderr is not a TTY)")
     parser.add_argument("--config", type=Path, default=None,
                         help="Path to user config YAML overlay")
+    parser.add_argument("--xmp-sidecars", dest="xmp_sidecars",
+                        action="store_true", default=None,
+                        help="Mirror every metadata write into a sibling "
+                             "IMG_1234.jpg.xmp sidecar (and merge it back on "
+                             "read). Off by default; see docs/xmp-schema.md §1.3.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -49,5 +54,7 @@ def main():
 
     args = parser.parse_args()
     setup_logging(verbose=args.verbose, log_spec=args.log_spec)
-    load_config(user_config_path=args.config)
+    cfg = load_config(user_config_path=args.config)
+    if args.xmp_sidecars:
+        cfg.xmp.sidecars = True
     args.func(args)

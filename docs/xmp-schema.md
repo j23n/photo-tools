@@ -53,7 +53,34 @@ Namespace URI: **`https://github.com/j23n/photo-tools/ns/1.0/`**
 | `photo-tools:CLIPModel` | string (e.g. `ViT-B-32/laion2b_s34b_b79k`) | Model identifier for the cached embedding. |
 | `photo-tools:DateBackfilledFrom` | string (e.g. `filename:whatsapp`, `mtime`) | Provenance for `dates backfill` writes. Presence means `DateTimeOriginal` was reconstructed, not original. |
 
-### 1.3 Fields photo-tools does not write
+### 1.3 XMP sidecars (opt-in)
+
+Sidecar mirroring is **off by default**. Pass `--xmp-sidecars` (or set
+`xmp.sidecars: true` in config) to enable it; otherwise every write
+goes straight to the file and sidecars are not consulted on read.
+
+When enabled, every write goes to **both** the image file and a sibling
+XMP sidecar named `IMG_1234.jpg.xmp` (suffix preserved — the MWG /
+digiKam convention). Reads consider both files and merge: keyword
+fields are unioned with order-preserving dedup, scalar fields take the
+sidecar value when present and fall back to the image's. Sidecars are
+created on first write and updated in place with `-overwrite_original`
+thereafter.
+
+Per-format behaviour (with `--xmp-sidecars`):
+
+| File type | Embedded write | Sidecar write |
+| --- | --- | --- |
+| Images (JPEG, HEIC, PNG, TIFF, WEBP, DNG) | yes | yes |
+| Videos (MOV, MP4, MKV, …) | **no** — XMP doesn't round-trip cleanly through video containers, so the sidecar is the only store | yes |
+
+Tag groups not representable in XMP (`IPTC:Keywords`, `EXIF:*`,
+`QuickTime:*`) are silently dropped from the sidecar phase of a write;
+the embedded copy still gets them. `dc:Subject` (XMP) is a complete
+mirror of `IPTC:Keywords`, so the sidecar's leaf list is identical to
+the embedded copy's via that route.
+
+### 1.4 Fields photo-tools does not write
 
 These fields are deliberately absent from output:
 
@@ -62,7 +89,7 @@ These fields are deliberately absent from output:
 - `MediaPro:CatalogSets`
 - `MicrosoftPhoto:CategorySet`
 
-### 1.4 Sentinel mechanics
+### 1.5 Sentinel mechanics
 
 - A file is considered "already tagged" iff `photo-tools:TaggerVersion` is
   present.

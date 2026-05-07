@@ -73,6 +73,189 @@ def _run_exiftool_json(
 
 
 # ---------------------------------------------------------------------------
+# XMP sidecar handling (see docs/xmp-schema.md §1.5)
+#
+# Every photo-tools write goes to the image and a sibling XMP sidecar
+# (IMG_1234.jpg -> IMG_1234.jpg.xmp). Videos skip the embedded write —
+# XMP doesn't round-trip through most video containers, so the sidecar
+# is the canonical store there. Reads consider both files and merge:
+# list fields (keywords, OCR phrases) union-and-dedup; scalars take the
+# sidecar value when present, falling back to the embedded value.
+# ---------------------------------------------------------------------------
+
+def xmp_sidecar_path(path: Path) -> Path:
+    """IMG_1234.jpg → IMG_1234.jpg.xmp.
+
+    Suffix is preserved (MWG / digiKam convention) so files sharing a
+    stem ('IMG_1234.jpg' and 'IMG_1234.heic') get distinct sidecars.
+    """
+    return path.with_suffix(path.suffix + ".xmp")
+
+
+# Tag-write args targeting these groups can't go into a pure XMP file
+# (no IPTC/EXIF/QuickTime sections in an XMP sidecar). Stripped before
+# the sidecar phase of every write.
+_NON_XMP_GROUPS = ("IPTC:", "EXIF:", "QuickTime:", "MakerNotes:", "File:")
+_WRITE_OPS = ("+=", "-=", "<=", ">=", "=")
+
+
+def _is_non_xmp_write_arg(arg: str) -> bool:
+    """True if `arg` is `-Group:Tag<op>value` targeting a non-XMP group."""
+    if not arg.startswith("-") or len(arg) < 2:
+        return False
+    body = arg[1:]
+    for op in _WRITE_OPS:
+        if op in body:
+            tag = body.split(op, 1)[0]
+            return any(tag.startswith(g) for g in _NON_XMP_GROUPS)
+    return False
+
+
+def _xmp_only_args(args: list[str]) -> list[str]:
+    return [a for a in args if not _is_non_xmp_write_arg(a)]
+
+
+def _sidecars_enabled() -> bool:
+    """Whether sidecar reads/writes are active. Off by default; opt in
+    via --xmp-sidecars (or `xmp.sidecars: true` in config).
+    """
+    return bool(getattr(getattr(get_config(), "xmp", None), "sidecars", False))
+
+
+def _write_targets(path: Path) -> list[Path]:
+    """Targets for a metadata write.
+
+    With sidecars enabled: [image, sidecar] for images, [sidecar] for
+    videos (XMP doesn't round-trip through most video containers).
+    With sidecars disabled: [path] — write straight to the file and
+    let exiftool handle the container.
+    """
+    if not _sidecars_enabled():
+        return [path]
+    sidecar = xmp_sidecar_path(path)
+    if is_video(path):
+        return [sidecar]
+    return [path, sidecar]
+
+
+def _exec_write(
+    args: list[str],
+    targets: list[Path],
+    *,
+    with_config: bool = True,
+    timeout: float | None = None,
+) -> tuple[bool, str]:
+    """Run exiftool with `args` against `targets`, splitting image vs
+    sidecar phases. Sidecar phase strips non-XMP write args. Returns
+    (all_succeeded, last_stderr).
+    """
+    image_targets = [t for t in targets if t.suffix.lower() != ".xmp"]
+    sidecar_targets = [t for t in targets if t.suffix.lower() == ".xmp"]
+
+    success = True
+    last_err = ""
+
+    if image_targets:
+        cmd = list(args) + [str(t) for t in image_targets]
+        r = _run_exiftool(cmd, with_config=with_config, timeout=timeout)
+        if r.returncode != 0:
+            success = False
+            last_err = r.stderr.strip()
+
+    if sidecar_targets:
+        cmd = _xmp_only_args(args) + [str(t) for t in sidecar_targets]
+        r = _run_exiftool(cmd, with_config=with_config, timeout=timeout)
+        if r.returncode != 0:
+            success = False
+            last_err = r.stderr.strip()
+
+    return success, last_err
+
+
+def _expand_paths_with_sidecars(
+    paths: list[Path],
+) -> tuple[list[str], dict[str, Path]]:
+    """Expand `paths` for an exiftool read: each image plus its sidecar
+    if one exists. Returns (file_strs, str_to_logical_path). Both
+    embedded and sidecar SourceFile strings map back to the logical
+    image path so callers can merge per-image.
+    """
+    files: list[str] = []
+    str_to_path: dict[str, Path] = {}
+    sidecars_on = _sidecars_enabled()
+    for p in paths:
+        files.append(str(p))
+        str_to_path[str(p)] = p
+        if not sidecars_on:
+            continue
+        sidecar = xmp_sidecar_path(p)
+        if sidecar.exists():
+            files.append(str(sidecar))
+            str_to_path[str(sidecar)] = p
+    return files, str_to_path
+
+
+_LIST_MERGE_FIELDS = {"Keywords", "Subject", "TagsList", "OCRText"}
+
+
+def _merge_metas(metas: list[dict]) -> dict:
+    """Merge exiftool result entries for one logical image.
+
+    Caller orders entries embedded-first, sidecar-last. Keyword /
+    Subject / TagsList / OCRText are unioned with order-preserving
+    dedup; other fields take the last non-empty value (sidecar wins).
+    """
+    if not metas:
+        return {}
+    merged: dict = {}
+    for meta in metas:
+        for k, v in meta.items():
+            if k == "SourceFile":
+                continue
+            if k in _LIST_MERGE_FIELDS:
+                cur = merged.get(k)
+                cur_list = [cur] if isinstance(cur, str) else list(cur or [])
+                new_list = [v] if isinstance(v, str) else list(v or [])
+                seen = set()
+                out = []
+                for x in cur_list + new_list:
+                    if x not in seen:
+                        seen.add(x)
+                        out.append(x)
+                if out:
+                    merged[k] = out
+            else:
+                if v not in (None, "", [], {}):
+                    merged[k] = v
+    if "SourceFile" in metas[0]:
+        merged["SourceFile"] = metas[0]["SourceFile"]
+    return merged
+
+
+def _group_metas_by_path(
+    metas: list[dict], str_to_path: dict[str, Path]
+) -> dict[Path, dict]:
+    """Group exiftool results by logical image path, merging the
+    image's embedded entry with its sidecar entry. Sidecar entries are
+    placed last so they win on scalar conflicts.
+    """
+    by_path: dict[Path, list[dict]] = {}
+    for meta in metas:
+        source = meta.get("SourceFile", "")
+        path = str_to_path.get(source)
+        if path is None:
+            continue
+        by_path.setdefault(path, []).append(meta)
+    out: dict[Path, dict] = {}
+    for path, entries in by_path.items():
+        entries.sort(
+            key=lambda m: 1 if m.get("SourceFile", "").lower().endswith(".xmp") else 0
+        )
+        out[path] = _merge_metas(entries)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Tag utilities
 # ---------------------------------------------------------------------------
 
@@ -149,12 +332,11 @@ def add_tags(
     ])
     for field, value in (namespace_fields or {}).items():
         args.append(f"-XMP-phototools:{field}={value}")
-    args.append(str(path))
 
     try:
-        result = _run_exiftool(args)
-        if result.returncode != 0:
-            log.error("exiftool failed for %s: %s", path.name, result.stderr.strip())
+        ok, err = _exec_write(args, _write_targets(path))
+        if not ok:
+            log.error("exiftool failed for %s: %s", path.name, err)
             return False
         log.info("Wrote %d keywords to %s", len(keywords), path.name)
         return True
@@ -192,12 +374,18 @@ def remove_tags(
         args = ["-overwrite_original"]
         for tag in tags:
             args.extend(_build_tag_args(tag, "-="))
-        args.extend(str(f) for f in batch)
+
+        targets: list[Path] = []
+        for p in batch:
+            targets.extend(_write_targets(p))
+        # Drop sidecar targets that don't exist yet — `-=` on a missing
+        # file would create it just to clear non-existent fields.
+        targets = [t for t in targets if t.suffix.lower() != ".xmp" or t.exists()]
 
         try:
-            result = _run_exiftool(args, with_config=False)
-            if result.returncode != 0:
-                log.warning("Could not remove tags: %s", result.stderr.strip())
+            ok, err = _exec_write(args, targets, with_config=False)
+            if not ok:
+                log.warning("Could not remove tags: %s", err)
                 success = False
         except Exception as e:
             log.warning("Error removing tags: %s", e)
@@ -216,12 +404,13 @@ def clear_all_keywords(path: Path, dry_run: bool = False) -> bool:
         "-overwrite_original",
         "-IPTC:Keywords=", "-XMP-dc:Subject=",
         "-XMP-digiKam:TagsList=",
-        str(path),
     ]
+    targets = [t for t in _write_targets(path)
+               if t.suffix.lower() != ".xmp" or t.exists()]
     try:
-        result = _run_exiftool(args, with_config=False)
-        if result.returncode != 0:
-            log.warning("Could not clear keywords from %s: %s", path.name, result.stderr.strip())
+        ok, err = _exec_write(args, targets, with_config=False)
+        if not ok:
+            log.warning("Could not clear keywords from %s: %s", path.name, err)
             return False
         log.debug("Cleared ALL keywords from %s", path.name)
         return True
@@ -254,17 +443,15 @@ def _read_people_tags(paths: list[Path]) -> dict[Path, list[str]]:
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
+        files, str_to_path = _expand_paths_with_sidecars(batch)
         meta_list = _run_exiftool_json(
-            ["-XMP-digiKam:TagsList"] + [str(p) for p in batch],
+            ["-XMP-digiKam:TagsList"] + files,
             with_config=False, timeout=120,
         )
         if not meta_list:
             continue
 
-        str_to_path = {str(p): p for p in batch}
-        for meta in meta_list:
-            source = meta.get("SourceFile", "")
-            path = str_to_path.get(source, Path(source))
+        for path, meta in _group_metas_by_path(meta_list, str_to_path).items():
             tags = meta.get("TagsList", [])
             if isinstance(tags, str):
                 tags = [tags]
@@ -307,11 +494,15 @@ def clear_all_tags(
     # Fast path: files with no People/* tags — batch-wipe.
     for i in range(0, len(no_people), batch_size):
         batch = no_people[i:i + batch_size]
-        args = ["-overwrite_original", *clear_args, *(str(f) for f in batch)]
+        args = ["-overwrite_original", *clear_args]
+        targets: list[Path] = []
+        for p in batch:
+            targets.extend(_write_targets(p))
+        targets = [t for t in targets if t.suffix.lower() != ".xmp" or t.exists()]
         try:
-            result = _run_exiftool(args)
-            if result.returncode != 0:
-                log.warning("Could not clear tags: %s", result.stderr.strip())
+            ok, err = _exec_write(args, targets)
+            if not ok:
+                log.warning("Could not clear tags: %s", err)
                 success = False
         except Exception as e:
             log.warning("Error clearing tags: %s", e)
@@ -327,12 +518,12 @@ def clear_all_tags(
                 f"-XMP-dc:Subject+={leaf}",
                 f"-XMP-digiKam:TagsList+={tag}",
             ])
-        args.append(str(path))
+        targets = [t for t in _write_targets(path)
+                   if t.suffix.lower() != ".xmp" or t.exists()]
         try:
-            result = _run_exiftool(args)
-            if result.returncode != 0:
-                log.warning("Could not clear tags from %s: %s",
-                            path.name, result.stderr.strip())
+            ok, err = _exec_write(args, targets)
+            if not ok:
+                log.warning("Could not clear tags from %s: %s", path.name, err)
                 success = False
         except Exception as e:
             log.warning("Error clearing tags from %s: %s", path.name, e)
@@ -359,8 +550,11 @@ def read_exif(path: Path) -> dict:
         "-struct", "-n",
     ]
     try:
-        meta = _run_exiftool_json(fields + [str(path)], timeout=30)
-        return meta[0] if meta else {}
+        files, str_to_path = _expand_paths_with_sidecars([path])
+        metas = _run_exiftool_json(fields + files, timeout=30)
+        if not metas:
+            return {}
+        return _group_metas_by_path(metas, str_to_path).get(path, {})
     except Exception as e:
         log.warning("Could not read EXIF from %s: %s", path, e)
         return {}
@@ -418,9 +612,10 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
+        files, str_to_path = _expand_paths_with_sidecars(batch)
         meta_list = _run_exiftool_json(
             ["-IPTC:Keywords", "-XMP:Subject", "-XMP-digiKam:TagsList"]
-            + [str(p) for p in batch],
+            + files,
             with_config=False, timeout=120,
         )
         if not meta_list:
@@ -429,10 +624,7 @@ def read_keywords_batch(paths: list[Path]) -> dict[Path, set[str]]:
                 result[p] = get_existing_keywords(exif)
             continue
 
-        str_to_path = {str(p): p for p in batch}
-        for meta in meta_list:
-            source = meta.get("SourceFile", "")
-            path = str_to_path.get(source, Path(source))
+        for path, meta in _group_metas_by_path(meta_list, str_to_path).items():
             result[path] = get_existing_keywords(meta)
 
     return result
@@ -453,18 +645,15 @@ def read_dates_batch(paths: list[Path]) -> dict[Path, dict]:
 
     for i in range(0, len(paths), batch_size):
         batch = paths[i:i + batch_size]
+        files, str_to_path = _expand_paths_with_sidecars(batch)
         meta_list = _run_exiftool_json(
-            ["-DateTimeOriginal", "-CreateDate"]
-            + [str(p) for p in batch],
+            ["-DateTimeOriginal", "-CreateDate"] + files,
             with_config=False, timeout=120,
         )
         if not meta_list:
             continue
 
-        str_to_path = {str(p): p for p in batch}
-        for meta in meta_list:
-            source = meta.get("SourceFile", "")
-            path = str_to_path.get(source, Path(source))
+        for path, meta in _group_metas_by_path(meta_list, str_to_path).items():
             result[path] = {
                 "DateTimeOriginal": meta.get("DateTimeOriginal"),
                 "CreateDate": meta.get("CreateDate"),
@@ -494,14 +683,9 @@ def write_dates(
 
     args = ["-overwrite_original"]
     if is_video(path):
-        args += [
-            f"-QuickTime:CreateDate={stamp}",
-            f"-QuickTime:ModifyDate={stamp}",
-            f"-QuickTime:TrackCreateDate={stamp}",
-            f"-QuickTime:TrackModifyDate={stamp}",
-            f"-QuickTime:MediaCreateDate={stamp}",
-            f"-QuickTime:MediaModifyDate={stamp}",
-        ]
+        # Videos go to sidecar only (see _write_targets) — QuickTime
+        # writes are skipped for videos so the container is untouched.
+        pass
     else:
         args += [
             f"-EXIF:DateTimeOriginal={stamp}",
@@ -512,14 +696,12 @@ def write_dates(
     args += [
         f"-XMP-xmp:CreateDate={stamp}",
         f"-XMP-phototools:DateBackfilledFrom={source}",
-        str(path),
     ]
 
     try:
-        result = _run_exiftool(args)
-        if result.returncode != 0:
-            log.error("exiftool failed for %s: %s",
-                      path.name, result.stderr.strip())
+        ok, err = _exec_write(args, _write_targets(path))
+        if not ok:
+            log.error("exiftool failed for %s: %s", path.name, err)
             return False
         log.debug("Wrote %s to %s (source: %s)", stamp, path.name, source)
         return True
@@ -550,21 +732,18 @@ def read_tagger_versions_batch(paths: list[Path]) -> dict[Path, str]:
         log.info("Reading TaggerVersion batch %d/%d (%d files, %d/%d total)",
                  batch_idx, n_batches, len(batch),
                  min(i + len(batch), total), total)
+        files, str_to_path = _expand_paths_with_sidecars(batch)
         meta_list = _run_exiftool_json(
-            ["-XMP-phototools:TaggerVersion"] + [str(p) for p in batch],
+            ["-XMP-phototools:TaggerVersion"] + files,
             timeout=120,
         )
         if not meta_list:
             continue
 
-        str_to_path = {str(p): p for p in batch}
-        for meta in meta_list:
+        for path, meta in _group_metas_by_path(meta_list, str_to_path).items():
             version = meta.get("TaggerVersion")
-            if not version:
-                continue
-            source = meta.get("SourceFile", "")
-            path = str_to_path.get(source, Path(source))
-            result[path] = str(version)
+            if version:
+                result[path] = str(version)
 
     return result
 
@@ -841,25 +1020,23 @@ def read_cached_embeddings_batch(
         log.info("Reading embedding batch %d/%d (%d files, %d/%d total)",
                  batch_idx, n_batches, len(batch),
                  min(i + len(batch), total), total)
+        files, str_to_path = _expand_paths_with_sidecars(batch)
         meta_list = _run_exiftool_json(
             ["-XMP-phototools:CLIPEmbedding",
              "-XMP-phototools:CLIPModel"]
-            + [str(p) for p in batch],
+            + files,
             timeout=120,
         )
         if not meta_list:
             continue
 
-        str_to_path = {str(p): p for p in batch}
         hits = 0
-        for meta in meta_list:
+        for path, meta in _group_metas_by_path(meta_list, str_to_path).items():
             if meta.get("CLIPModel") != model:
                 continue
             b64 = meta.get("CLIPEmbedding", "")
             if not b64:
                 continue
-            source = meta.get("SourceFile", "")
-            path = str_to_path.get(source, Path(source))
             try:
                 result[path] = np.frombuffer(
                     base64.b64decode(b64), dtype=np.float32
@@ -878,15 +1055,14 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
     if dry_run:
         log.info("[DRY RUN] Would cache embedding for %s", path.name)
         return
-    result = _run_exiftool([
+    args = [
         "-overwrite_original",
         f"-XMP-phototools:CLIPEmbedding={b64}",
         f"-XMP-phototools:CLIPModel={model}",
-        str(path),
-    ])
-    if result.returncode != 0:
-        log.warning("Failed to cache embedding for %s: %s",
-                    path.name, result.stderr.strip())
+    ]
+    ok, err = _exec_write(args, _write_targets(path))
+    if not ok:
+        log.warning("Failed to cache embedding for %s: %s", path.name, err)
 
 
 # IPTC role identifier marking a region as OCR-derived text. Mirrored on read
@@ -959,6 +1135,8 @@ def write_metadata(
         if embedding_model:
             args.append(f"-XMP-phototools:CLIPModel={embedding_model}")
 
+    targets = _write_targets(path)
+
     tmp_path: str | None = None
     if new_ocr_regions:
         iptc_regions = list(existing_iptc_regions or [])
@@ -975,14 +1153,19 @@ def write_metadata(
                     "RbW": round(r["w"], 5), "RbH": round(r["h"], 5),
                 },
             })
-        sidecar = {
-            "SourceFile": str(path),
-            "XMP-iptcExt:ImageRegion": iptc_regions,
-        }
-        if ocr_text:
-            sidecar["XMP-phototools:OCRText"] = ocr_text
+        # One JSON entry per target so exiftool routes structures to
+        # both the image and the sidecar via SourceFile matching.
+        sidecar_entries = []
+        for t in targets:
+            entry: dict = {
+                "SourceFile": str(t),
+                "XMP-iptcExt:ImageRegion": iptc_regions,
+            }
+            if ocr_text:
+                entry["XMP-phototools:OCRText"] = ocr_text
+            sidecar_entries.append(entry)
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        json.dump([sidecar], tmp)
+        json.dump(sidecar_entries, tmp)
         tmp.close()
         tmp_path = tmp.name
         args = ["-struct", f"-json={tmp_path}"] + args
@@ -992,12 +1175,10 @@ def write_metadata(
         for phrase in ocr_text:
             args.append(f"-XMP-phototools:OCRText+={phrase}")
 
-    args.append(str(path))
-
     try:
-        result = _run_exiftool(args, timeout=60)
-        if result.returncode != 0:
-            log.error("exiftool failed for %s: %s", path.name, result.stderr.strip())
+        ok, err = _exec_write(args, targets, timeout=60)
+        if not ok:
+            log.error("exiftool failed for %s: %s", path.name, err)
             return False
         parts = []
         if new_keywords:
