@@ -96,6 +96,46 @@ LANDMARK_TYPES = [
     ("Q133056", "cave", 500),
 ]
 
+# Bounding boxes for regional supplementary queries (lat_min, lat_max, lon_min, lon_max).
+# Counters Europe-skew of the global pass by re-querying within non-European
+# regions where regional sitelink counts dominate.
+NON_EUROPE_REGIONS = [
+    ("Asia",        5,  72,   35, 150),
+    ("Africa",    -35,  35,  -20,  35),
+    ("N.America",  10,  72, -170, -50),
+    ("S.America", -55,  15,  -85, -35),
+    ("Oceania",   -50, -10,  110, 180),
+]
+
+# Subset of LANDMARK_TYPES used for the regional pass.  Regionally-niche
+# categories (synagogue, pagoda, stupa, Shinto shrine) are already adequately
+# covered by the global pass; the regional pass focuses on universal categories
+# where regional results would otherwise be drowned by Europe in a global
+# sitelinks contest.
+REGIONAL_TYPES = [
+    ("Q570116",  "tourist attraction",      400),
+    ("Q4989906", "monument",                400),
+    ("Q839954",  "archaeological site",     400),
+    ("Q811979",  "architectural structure", 400),
+    ("Q44539",   "temple",                  300),
+    ("Q33506",   "museum",                  300),
+    ("Q8502",    "mountain",                300),
+    ("Q23413",   "palace",                  300),
+]
+
+# Maximum share of the final budget per region.  Caps Europe-domination while
+# accepting that Wikidata's coverage is uneven globally.  Region classification
+# is by lat/lon bucket — see _classify_region.
+REGION_MAX_SHARE = {
+    "Europe":    0.40,
+    "Asia":      0.25,
+    "N.America": 0.10,
+    "Africa":    0.10,
+    "S.America": 0.08,
+    "Oceania":   0.02,
+    "Other":     0.05,
+}
+
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 
 # Wikidata image properties to collect per landmark (all curator-assigned)
@@ -222,65 +262,185 @@ def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[dict]:
     return urls[:target]
 
 
-def query_wikidata(limit: int) -> list[dict]:
-    """Query Wikidata SPARQL for notable landmarks, one type at a time.
+def _classify_region(lat: float, lon: float) -> str:
+    """Bucket a (lat, lon) into a coarse continent label for per-region capping.
 
-    Each type gets an equal share of *limit* (per-type quota).  Types that
-    return fewer results than their quota leave room for an overflow pass
-    that fills remaining slots from the most notable leftover landmarks
-    across all types.  This prevents high-sitelink European types from
-    crowding out underrepresented regions.
+    Mediterranean North Africa west of Egypt is intentionally claimed by
+    Europe given the fuzzy boundary; this is a small fraction of total
+    landmarks.
     """
-    log.info("Querying Wikidata for top %d landmarks across %d types ...", limit, len(LANDMARK_TYPES))
+    if -50 <= lat <= -10 and 110 <= lon <= 180:
+        return "Oceania"
+    if 10 <= lat <= 72 and -170 <= lon <= -50:
+        return "N.America"
+    if -55 <= lat <= 15 and -85 <= lon <= -35:
+        return "S.America"
+    if -35 <= lat < 35 and -20 <= lon <= 35:
+        return "Africa"
+    if 5 <= lat < 35 and 35 <= lon <= 150:
+        return "Asia"
+    if 35 <= lat <= 72 and 50 <= lon <= 180:
+        return "Asia"
+    if 35 <= lat <= 72 and -25 <= lon < 50:
+        return "Europe"
+    return "Other"
 
-    seen_ids: set[str] = set()
-    per_type: list[tuple[str, list[dict]]] = []
 
-    for qid, label, type_limit in LANDMARK_TYPES:
-        log.info("  Querying %s (%s, limit %d) ...", label, qid, type_limit)
+def _run_typed_query(
+    qid: str,
+    label: str,
+    type_limit: int,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> list[dict]:
+    """Execute a SPARQL type query (optionally bounded) and parse into landmarks.
+
+    When *bbox* is given (lat_min, lat_max, lon_min, lon_max) the geo-filtered
+    SPARQL variant is used.  Each result includes internal helper fields
+    (``_sitelinks``, ``_type``, ``_region``) that are stripped before the
+    final return to callers.
+    """
+    if bbox is not None:
+        lat_min, lat_max, lon_min, lon_max = bbox
+        query = SPARQL_TYPE_GEO_QUERY.format(
+            qid=qid, limit=type_limit,
+            lat_min=lat_min, lat_max=lat_max,
+            lon_min=lon_min, lon_max=lon_max,
+        )
+    else:
         query = SPARQL_TYPE_QUERY.format(qid=qid, limit=type_limit)
-        results = _sparql_get(query)
-        log.info("  Got %d results for %s", len(results), label)
 
-        type_results: list[dict] = []
-        for r in results:
-            wikidata_id = r["item"]["value"].rsplit("/", 1)[-1]
-            if wikidata_id in seen_ids:
-                continue
-            seen_ids.add(wikidata_id)
-            type_results.append({
+    raw = _sparql_get(query)
+    parsed: list[dict] = []
+    for r in raw:
+        try:
+            lat = float(r["lat"]["value"])
+            lon = float(r["lon"]["value"])
+            parsed.append({
                 "name": r["itemLabel"]["value"],
-                "wikidata_id": wikidata_id,
-                "lat": float(r["lat"]["value"]),
-                "lon": float(r["lon"]["value"]),
+                "wikidata_id": r["item"]["value"].rsplit("/", 1)[-1],
+                "lat": lat,
+                "lon": lon,
                 "image_url": r["image"]["value"],
                 "_sitelinks": int(r["sitelinks"]["value"]),
+                "_type": label,
+                "_region": _classify_region(lat, lon),
             })
-        # Results arrive sorted by sitelinks desc from SPARQL ORDER BY
-        per_type.append((label, type_results))
+        except (KeyError, ValueError):
+            continue
+    return parsed
+
+
+def _select_by_region_cap(candidates: list[dict], limit: int) -> list[dict]:
+    """Select up to *limit* landmarks honoring REGION_MAX_SHARE caps.
+
+    Within each region, applies an equal per-type quota and fills the
+    remaining region capacity from the sitelink-sorted overflow.  Internal
+    fields (``_sitelinks``, ``_type``, ``_region``) are stripped before
+    return.
+    """
+    by_region: dict[str, list[dict]] = {}
+    for r in candidates:
+        by_region.setdefault(r["_region"], []).append(r)
+
+    selected: list[dict] = []
+    region_summary: list[tuple[str, int, int, int]] = []
+
+    for region_name, region_pool in by_region.items():
+        share = REGION_MAX_SHARE.get(region_name, 0.05)
+        cap = max(int(share * limit), 1)
+
+        by_type: dict[str, list[dict]] = {}
+        for r in region_pool:
+            by_type.setdefault(r["_type"], []).append(r)
+        for type_results in by_type.values():
+            type_results.sort(key=lambda x: x["_sitelinks"], reverse=True)
+
+        type_quota = max(cap // len(LANDMARK_TYPES), 1)
+        region_selected: list[dict] = []
+        region_overflow: list[dict] = []
+        for type_results in by_type.values():
+            region_selected.extend(type_results[:type_quota])
+            region_overflow.extend(type_results[type_quota:])
+
+        region_overflow.sort(key=lambda x: x["_sitelinks"], reverse=True)
+        remaining = cap - len(region_selected)
+        if remaining > 0:
+            region_selected.extend(region_overflow[:remaining])
+
+        region_selected = region_selected[:cap]
+        selected.extend(region_selected)
+        region_summary.append((region_name, len(region_pool), cap, len(region_selected)))
+
+    log.info("Per-region selection (cap = REGION_MAX_SHARE × limit):")
+    for name, pool, cap, picked in sorted(region_summary, key=lambda x: -x[3]):
+        log.info("  %-10s pool=%5d  cap=%5d  picked=%5d", name, pool, cap, picked)
+
+    selected.sort(key=lambda x: x["_sitelinks"], reverse=True)
+    selected = selected[:limit]
+    for r in selected:
+        for k in ("_sitelinks", "_type", "_region"):
+            r.pop(k, None)
+
+    log.info("Selected %d landmarks total (limit %d)", len(selected), limit)
+    return selected
+
+
+def query_wikidata(limit: int) -> list[dict]:
+    """Query Wikidata for notable landmarks with regional rebalancing.
+
+    Two-pass strategy:
+
+    1. **Global per-type pass** — one SPARQL query per LANDMARK_TYPES entry,
+       sorted by sitelink count.  Sitelinks favor European-language coverage,
+       so this pass alone produces a Europe-dominated pool.
+    2. **Regional supplementary pass** — for each NON_EUROPE_REGIONS bbox,
+       runs REGIONAL_TYPES (a subset of universal categories) with a geo
+       filter.  Surfaces high-sitelink-within-region landmarks that lose to
+       Europe in a global ranking.
+
+    Candidates are deduplicated across all queries (``seen_ids``), then
+    merged by :func:`_select_by_region_cap` which enforces a per-region
+    maximum share (REGION_MAX_SHARE) and applies per-type quotas within
+    each region.
+    """
+    total_queries = len(LANDMARK_TYPES) + len(NON_EUROPE_REGIONS) * len(REGIONAL_TYPES)
+    log.info(
+        "Querying Wikidata: global (%d types) + regional (%d regions × %d types) "
+        "= %d SPARQL queries",
+        len(LANDMARK_TYPES), len(NON_EUROPE_REGIONS), len(REGIONAL_TYPES),
+        total_queries,
+    )
+
+    seen_ids: set[str] = set()
+    candidates: list[dict] = []
+
+    log.info("Phase 1/2: global per-type queries")
+    for qid, label, type_limit in LANDMARK_TYPES:
+        log.info("  [global] %s (%s, limit %d) ...", label, qid, type_limit)
+        results = _run_typed_query(qid, label, type_limit)
+        new = [r for r in results if r["wikidata_id"] not in seen_ids]
+        seen_ids.update(r["wikidata_id"] for r in new)
+        candidates.extend(new)
+        log.info("    %d results, +%d new (%d total)",
+                 len(results), len(new), len(candidates))
         time.sleep(2)
 
-    # Per-type quotas: each type gets an equal share, then overflow fills
-    # remaining slots from the most notable leftover landmarks globally
-    quota = limit // len(LANDMARK_TYPES)
-    landmarks: list[dict] = []
-    overflow: list[dict] = []
+    log.info("Phase 2/2: regional bounded queries")
+    for region_name, lat_min, lat_max, lon_min, lon_max in NON_EUROPE_REGIONS:
+        log.info("  Region %s (lat %.0f..%.0f, lon %.0f..%.0f)",
+                 region_name, lat_min, lat_max, lon_min, lon_max)
+        bbox = (lat_min, lat_max, lon_min, lon_max)
+        for qid, label, type_limit in REGIONAL_TYPES:
+            results = _run_typed_query(qid, label, type_limit, bbox=bbox)
+            new = [r for r in results if r["wikidata_id"] not in seen_ids]
+            seen_ids.update(r["wikidata_id"] for r in new)
+            candidates.extend(new)
+            log.info("    [%s] %s: %d results, +%d new",
+                     region_name, label, len(results), len(new))
+            time.sleep(2)
 
-    for label, type_results in per_type:
-        landmarks.extend(type_results[:quota])
-        overflow.extend(type_results[quota:])
-
-    remaining = limit - len(landmarks)
-    if remaining > 0:
-        overflow.sort(key=lambda x: x["_sitelinks"], reverse=True)
-        landmarks.extend(overflow[:remaining])
-
-    for lm in landmarks:
-        del lm["_sitelinks"]
-
-    log.info("Selected %d landmarks (%d per-type quota, %d types)",
-             len(landmarks), quota, len(LANDMARK_TYPES))
-    return landmarks
+    log.info("Total unique candidates after both passes: %d", len(candidates))
+    return _select_by_region_cap(candidates, limit)
 
 
 def query_wikidata_geo(
@@ -472,7 +632,9 @@ def build_database(
             existing[lm["wikidata_id"]] = lm
         log.info("Resuming: %d landmarks already computed", len(existing))
 
-    dump_path = output_path.with_suffix(".wikidata.json")
+    # Bumped to v2 when regional rebalancing was added — old caches lack the
+    # diversified pool, so they would short-circuit the new query strategy.
+    dump_path = output_path.with_suffix(".wikidata-v2.json")
     if wikidata_cache and wikidata_cache.exists():
         with open(wikidata_cache) as f:
             landmarks = json.load(f)[:limit]
