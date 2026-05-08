@@ -261,49 +261,67 @@ def reverse_geocode(lat: float, lon: float) -> dict:
     return addr
 
 
-def tags_from_gps(exif: dict) -> tuple[list[str], str | None]:
-    """Return (places_tags, country_code).
+def tags_from_gps(exif: dict) -> tuple[list[str], str | None, dict[str, str]]:
+    """Return (places_tags, country_code, location_parts).
 
     `places_tags` is a list with at most one entry — the single nested
     `Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]` path with missing
     levels collapsed. `country_code` is the ISO 3166-1 alpha-2 code (uppercase)
-    or None; it is written separately to photo-tools:CountryCode.
+    or None; it is written separately to photo-tools:CountryCode plus the
+    standard IPTC country-code fields.
+
+    `location_parts` is a dict with optional keys `Country`, `State`, `City`,
+    `Sublocation`, `CountryCode` — the same components as the Places path,
+    intended for the IPTC-standard structured location fields (see
+    docs/xmp-schema.md §1.5).
     """
     coords = get_gps_coords(exif)
     if coords is None:
-        return [], None
+        return [], None, {}
     lat, lon = coords
     log_geo.debug("lookup (%.5f, %.5f)", lat, lon)
     address = reverse_geocode(lat, lon)
     if not address:
-        return [], None
+        return [], None, {}
 
     segments = []
+    location_parts: dict[str, str] = {}
+
     country = address.get("country")
     if country:
-        segments.append(title(country))
+        c = title(country)
+        segments.append(c)
+        location_parts["Country"] = c
 
     region = (address.get("state") or address.get("region")
               or address.get("province") or address.get("county"))
     if region:
-        segments.append(title(region))
+        r = title(region)
+        segments.append(r)
+        location_parts["State"] = r
 
     city = (address.get("city") or address.get("town")
             or address.get("village") or address.get("municipality"))
     if city:
-        segments.append(title(city))
+        ct = title(city)
+        segments.append(ct)
+        location_parts["City"] = ct
 
     neighborhood = (address.get("suburb") or address.get("neighbourhood")
                     or address.get("quarter") or address.get("district"))
     if neighborhood:
-        segments.append(title(neighborhood))
+        n = title(neighborhood)
+        segments.append(n)
+        location_parts["Sublocation"] = n
 
     places = ["Places/" + "/".join(segments)] if segments else []
 
     cc = address.get("country_code")
     country_code = cc.upper() if cc else None
+    if country_code:
+        location_parts["CountryCode"] = country_code
 
-    return places, country_code
+    return places, country_code, location_parts
 
 
 # ---------------------------------------------------------------------------
@@ -537,10 +555,11 @@ def process_single(
     # ----- GPS reverse-geocoding ------------------------------------------
     places: list[str] = []
     country_code: str | None = None
+    location_parts: dict[str, str] = {}
     if enable_gps:
         with timed_step("geocoding", photo=path.name, catch=True) as s:
             s.ran = True
-            places, country_code = tags_from_gps(exif)
+            places, country_code, location_parts = tags_from_gps(exif)
             s.ok = True
             if places:
                 log_geo.info("%s → %s", path.name, places[0])
@@ -664,6 +683,20 @@ def process_single(
     if country_code:
         namespace_fields["CountryCode"] = country_code
 
+    # Project existing People/* keywords (digiKam-owned) into the IPTC
+    # PersonInImage list so non-digiKam consumers (Photo Mechanic, Mylio,
+    # Lightroom IPTC panel) can surface them.
+    person_in_image: list[str] | None = None
+    existing_tags_list = exif.get("TagsList") or []
+    if isinstance(existing_tags_list, str):
+        existing_tags_list = [existing_tags_list]
+    people_leaves = [
+        leaf_of(t) for t in existing_tags_list
+        if isinstance(t, str) and t.startswith("People/")
+    ]
+    if people_leaves:
+        person_in_image = deduplicate(people_leaves)
+
     embedding_model_id = (
         _get_clip_embedder(clip_model, clip_pretrained).model_id
         if embedding is not None else None
@@ -676,6 +709,8 @@ def process_single(
         path,
         new_keywords=new_tags,
         namespace_fields=namespace_fields,
+        location_fields=location_parts or None,
+        person_in_image=person_in_image,
         ocr_text=ocr_phrases if ocr_regions else None,
         new_ocr_regions=ocr_regions or None,
         existing_iptc_regions=existing_iptc_regions,

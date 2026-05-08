@@ -8,31 +8,47 @@ consumers can rely on.
 
 ## 1. Output fields
 
-photo-tools writes exactly **two keyword/tag fields** plus a small custom
+photo-tools writes four parallel keyword/tag fields, the IPTC-standard
+location fields, an `iptcExt:PersonInImage` projection, and a small custom
 XMP namespace for tool-private metadata.
 
 ### 1.1 Keyword/tag fields
 
-| Field | Content | Separator | Notes |
-| --- | --- | --- | --- |
-| `dc:subject` (mirrored to `IPTC:Keywords`) | Leaf names only | flat list | MWG-aligned; what Lightroom and most tools actually read |
-| `digiKam:TagsList` | Full hierarchy paths | `/` | digiKam's native hierarchy field |
+Every keyword fans out to four parallel fields so each consumer reads
+the form it understands:
 
-Both fields use **Titlecase** for every path segment (see §3).
+| Field | Content | Separator | Read by |
+| --- | --- | --- | --- |
+| `dc:subject` (mirrored to `IPTC:Keywords`) | Leaf names only | flat list | universal — Lightroom, digiKam, Bridge, Capture One, Mylio, Photo Mechanic, ACDSee, XnView, Excire, PhotoPrism, Immich, Win11 Photos, Synology Photos, … |
+| `digiKam:TagsList` | Full hierarchy paths | `/` | digiKam (native) |
+| `lr:HierarchicalSubject` | Full hierarchy paths | `\|` | Lightroom Classic, Adobe Bridge, ACDSee (read), some others |
+| `iptcExt:PersonInImage` | Person leaf names only — projected from `People/*` keywords | flat list | Photo Mechanic, Mylio, Lightroom IPTC panel, osxphotos |
+
+All segments use **Titlecase** (see §3). `iptcExt:PersonInImage` is
+populated from `People/*` keywords on the file (digiKam-owned, see §2.1)
+and replaced wholesale on each write so it stays in sync.
 
 For example:
 
 ```
-dc:subject       = [Alice, Bob, Italy, Lazio, Rome, Municipio Roma I,
-                    Colosseum, Balustrade, Rail, Building, Cityscape]
-IPTC:Keywords    = (same as dc:subject)
-digiKam:TagsList = [
-    People/Alice, People/Bob,                        # written by digiKam, not us
+dc:subject              = [Alice, Bob, Italy, Lazio, Rome, Municipio Roma I,
+                           Colosseum, Balustrade, Rail, Building, Cityscape]
+IPTC:Keywords           = (same as dc:subject)
+digiKam:TagsList        = [
+    People/Alice, People/Bob,                        # written by digiKam, preserved by us
     Places/Italy/Lazio/Rome/Municipio Roma I,
     Landmarks/Colosseum,
     Objects/Balustrade, Objects/Rail,
     Scenes/Building, Scenes/Cityscape,
 ]
+lr:HierarchicalSubject  = [
+    People|Alice, People|Bob,
+    Places|Italy|Lazio|Rome|Municipio Roma I,
+    Landmarks|Colosseum,
+    Objects|Balustrade, Objects|Rail,
+    Scenes|Building, Scenes|Cityscape,
+]
+iptcExt:PersonInImage   = [Alice, Bob]               # leaves of People/* only
 ```
 
 ### 1.2 photo-tools custom namespace
@@ -53,7 +69,35 @@ Namespace URI: **`https://github.com/j23n/photo-tools/ns/1.0/`**
 | `photo-tools:CLIPModel` | string (e.g. `ViT-B-32/laion2b_s34b_b79k`) | Model identifier for the cached embedding. |
 | `photo-tools:DateBackfilledFrom` | string (e.g. `filename:whatsapp`, `mtime`) | Provenance for `dates backfill` writes. Presence means `DateTimeOriginal` was reconstructed, not original. |
 
-### 1.3 XMP sidecars (opt-in)
+### 1.3 IPTC structured location fields
+
+When GPS reverse-geocoding produces a place, photo-tools also populates
+the IPTC-standard location fields so the data shows up in the **Location
+panel** of every keyword-aware DAM (Lightroom, Bridge, Capture One,
+Photo Mechanic, Mylio, ACDSee, …) instead of being buried in keywords.
+Each component fans out to one XMP target and one legacy IPTC IIM
+target:
+
+| Component | XMP field | Legacy IPTC IIM field |
+| --- | --- | --- |
+| Country (e.g. `Italy`) | `XMP-photoshop:Country` | `IPTC:Country-PrimaryLocationName` |
+| Country code (e.g. `IT`) | `XMP-iptcCore:CountryCode` | `IPTC:Country-PrimaryLocationCode` |
+| State / Province (e.g. `Lazio`) | `XMP-photoshop:State` | `IPTC:Province-State` |
+| City (e.g. `Rome`) | `XMP-photoshop:City` | `IPTC:City` |
+| Sublocation (e.g. `Municipio Roma I`) | `XMP-iptcCore:Location` | `IPTC:Sub-location` |
+
+The components mirror the segments of the `Places/*` keyword path. Both
+the keyword form (for taxonomy browsers like digiKam) and the IPTC form
+(for IPTC-panel UIs) are written.
+
+The country code is also kept in `photo-tools:CountryCode` (§1.2) for
+internal sentinel use; the IPTC field is the canonical export form.
+
+`IPTC:` writes are silently dropped during the sidecar phase of a write
+because XMP sidecars have no IPTC IIM section; the XMP fields cover that
+case.
+
+### 1.4 XMP sidecars (opt-in)
 
 Sidecar mirroring is **off by default**. Pass `--xmp-sidecars` (or set
 `xmp.sidecars: true` in config) to enable it; otherwise every write
@@ -75,21 +119,30 @@ Per-format behaviour (with `--xmp-sidecars`):
 | Videos (MOV, MP4, MKV, …) | **no** — XMP doesn't round-trip cleanly through video containers, so the sidecar is the only store | yes |
 
 Tag groups not representable in XMP (`IPTC:Keywords`, `EXIF:*`,
-`QuickTime:*`) are silently dropped from the sidecar phase of a write;
-the embedded copy still gets them. `dc:Subject` (XMP) is a complete
-mirror of `IPTC:Keywords`, so the sidecar's leaf list is identical to
-the embedded copy's via that route.
+`QuickTime:*`, `IPTC:City`, `IPTC:Sub-location`, …) are silently dropped
+from the sidecar phase of a write; the embedded copy still gets them.
+`dc:Subject` (XMP) is a complete mirror of `IPTC:Keywords`, so the
+sidecar's leaf list is identical to the embedded copy's via that route.
 
-### 1.4 Fields photo-tools does not write
+**Reading alternate sidecar names.** photo-tools writes the canonical
+`IMG_1234.jpg.xmp` form, but on *read* it also accepts `IMG_1234.xmp`
+(the Lightroom / Capture One convention) when the canonical form
+doesn't exist. Writes always produce the canonical form — this is
+read-side compatibility only.
+
+### 1.5 Fields photo-tools does not write
 
 These fields are deliberately absent from output:
 
-- `XMP-lr:HierarchicalSubject` — redundant with `digiKam:TagsList`.
-- `MicrosoftPhoto:LastKeywordXMP`
-- `MediaPro:CatalogSets`
-- `MicrosoftPhoto:CategorySet`
+- `MicrosoftPhoto:LastKeywordXMP` — Windows Live Photo Gallery, dead since 2017.
+- `MediaPro:CatalogSets` — iView / Expression Media, niche.
+- `MicrosoftPhoto:CategorySet` — Office Picture Manager, dead.
+- `XMP-acdsee-rs:*` — ACDSee proprietary face-region schema; we don't do face detection.
+- `XMP-mwg-rs:RegionInfo` (face regions) — owned by face-detector tools (digiKam,
+  Lightroom, Mylio). photo-tools doesn't do face detection, so it has no
+  coordinates to write. See §2.1.
 
-### 1.5 Sentinel mechanics
+### 1.6 Sentinel mechanics
 
 - A file is considered "already tagged" iff `photo-tools:TaggerVersion` is
   present.
@@ -117,7 +170,17 @@ the subcategory itself is the useful term, e.g. `Nature/Forest`).
 ### 2.1 People
 
 `People/*` is **owned by digiKam face recognition**. photo-tools never writes
-or removes anything under this root.
+or removes new entries under this root, and never writes face regions
+(`XMP-mwg-rs:RegionInfo`) — that's face-detector territory.
+
+What photo-tools *does* do with `People/*` keywords on a file:
+
+- **Preserves** them through `--clear-all` and `tags clear` (read first,
+  re-write after the wipe).
+- **Projects the leaf names to `XMP-iptcExt:PersonInImage`** on every
+  write, so non-digiKam consumers (Photo Mechanic, Mylio, Lightroom IPTC
+  panel, osxphotos) can surface the names. The list is replaced wholesale
+  on each write to stay in sync.
 
 ### 2.2 Places
 
@@ -130,8 +193,10 @@ Places/Italy/Rome                            ← region missing, collapse
 Places/France                                ← only country known
 ```
 
-The country code is written separately to `photo-tools:CountryCode` (see
-§1.2) and is not part of the keyword space.
+The same components are also written to the IPTC-standard structured
+location fields (`XMP-photoshop:City/State/Country`,
+`XMP-iptcCore:CountryCode`/`Location`, plus IPTC IIM mirrors) so the
+data shows up in the Location panel of every IPTC-aware DAM. See §1.3.
 
 ### 2.3 Objects
 
@@ -253,12 +318,20 @@ English mode rather than configuring per-locale callbacks.
 
 - **MWG / Lightroom / digiKam** all read leaf names from `dc:subject`. Keeping
   it leaf-only matches the convention.
-- **digiKam** writes `People/*` itself (face recognition) and reads/writes
-  `digiKam:TagsList` for hierarchy. Round-trip is clean.
-- **Lightroom** writes hierarchy to `lr:HierarchicalSubject` (`|` separator).
-  photo-tools does not mirror to it; users who want Lightroom-side hierarchy
-  can run exiftool to copy `digiKam:TagsList` → `lr:HierarchicalSubject`
-  themselves.
+- **digiKam** reads/writes `digiKam:TagsList` for hierarchy and owns the
+  `People/*` root for face recognition. Round-trip is clean.
+- **Lightroom Classic / Bridge** read hierarchy from `lr:HierarchicalSubject`
+  (`|` separator) and structured location from `XMP-photoshop:City/State/Country`.
+  photo-tools writes both, so the keyword hierarchy appears in Lightroom's
+  keyword panel and the Places path also surfaces in the Location panel.
+- **Photo Mechanic / Mylio / osxphotos** read `iptcExt:PersonInImage` and IPTC
+  location fields. photo-tools projects `People/*` leaves to `PersonInImage`
+  and writes IPTC location fields, so person and place data are visible there.
+- **Apple Photos** imports flat keywords from `IPTC:Keywords` / `dc:subject`
+  on first import only. Re-running photo-tools on a file already imported
+  into the Photos library will not re-sync — the library has a frozen copy.
+- **Google Photos** discards EXIF/IPTC/XMP metadata on upload. photo-tools
+  output is not preserved through a Google Photos round-trip.
 - **photo-tools custom namespace** is registered in
   `src/photo_tools/exiftool_phototools.config`. exiftool needs `-config
   exiftool_phototools.config` to read/write the namespace fields by name; the

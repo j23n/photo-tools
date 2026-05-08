@@ -11,8 +11,10 @@ import pytest
 from photo_tools.helpers import (
     _build_tag_args,
     _is_non_xmp_write_arg,
+    _location_field_args,
     _merge_metas,
     _xmp_only_args,
+    alt_xmp_sidecar_path,
     deduplicate,
     is_live_photo_motion,
     is_our_tag,
@@ -73,13 +75,35 @@ class TestXmpSidecarPath:
         assert xmp_sidecar_path(Path("/p/clip.mov")) == Path("/p/clip.mov.xmp")
 
 
+class TestAltXmpSidecarPath:
+    def test_replaces_suffix(self):
+        # Lightroom / Capture One convention.
+        assert alt_xmp_sidecar_path(Path("/p/IMG_1234.jpg")) == Path("/p/IMG_1234.xmp")
+        assert alt_xmp_sidecar_path(Path("/p/IMG_1234.HEIC")) == Path("/p/IMG_1234.xmp")
+
+    def test_returns_none_for_xmp_input(self):
+        # Don't return the input itself for an .xmp file.
+        assert alt_xmp_sidecar_path(Path("/p/IMG_1234.xmp")) is None
+
+
 class TestBuildTagArgs:
-    def test_emits_three_targets_with_leaf_for_flat_fields(self):
+    def test_non_people_tag_emits_four_targets(self):
         args = _build_tag_args("Places/Italy/Rome", "+=")
         assert args == [
             "-IPTC:Keywords+=Rome",
             "-XMP-dc:Subject+=Rome",
             "-XMP-digiKam:TagsList+=Places/Italy/Rome",
+            "-XMP-lr:HierarchicalSubject+=Places|Italy|Rome",
+        ]
+
+    def test_people_tag_includes_person_in_image(self):
+        args = _build_tag_args("People/Alice", "+=")
+        assert args == [
+            "-IPTC:Keywords+=Alice",
+            "-XMP-dc:Subject+=Alice",
+            "-XMP-digiKam:TagsList+=People/Alice",
+            "-XMP-lr:HierarchicalSubject+=People|Alice",
+            "-XMP-iptcExt:PersonInImage+=Alice",
         ]
 
     def test_remove_operator(self):
@@ -88,7 +112,52 @@ class TestBuildTagArgs:
             "-IPTC:Keywords-=Cat",
             "-XMP-dc:Subject-=Cat",
             "-XMP-digiKam:TagsList-=Objects/Cat",
+            "-XMP-lr:HierarchicalSubject-=Objects|Cat",
         ]
+
+
+class TestLocationFieldArgs:
+    def test_full_set_writes_xmp_and_iptc_pairs(self):
+        args = _location_field_args({
+            "Country": "Italy",
+            "State": "Lazio",
+            "City": "Rome",
+            "Sublocation": "Municipio Roma I",
+            "CountryCode": "IT",
+        })
+        # Each component fans out to one XMP target and one IPTC IIM target.
+        assert "-XMP-photoshop:Country=Italy" in args
+        assert "-IPTC:Country-PrimaryLocationName=Italy" in args
+        assert "-XMP-photoshop:State=Lazio" in args
+        assert "-IPTC:Province-State=Lazio" in args
+        assert "-XMP-photoshop:City=Rome" in args
+        assert "-IPTC:City=Rome" in args
+        assert "-XMP-iptcCore:Location=Municipio Roma I" in args
+        assert "-IPTC:Sub-location=Municipio Roma I" in args
+        assert "-XMP-iptcCore:CountryCode=IT" in args
+        assert "-IPTC:Country-PrimaryLocationCode=IT" in args
+
+    def test_partial_set_writes_only_present_components(self):
+        args = _location_field_args({"Country": "France"})
+        assert args == [
+            "-XMP-photoshop:Country=France",
+            "-IPTC:Country-PrimaryLocationName=France",
+        ]
+
+    def test_unknown_key_silently_skipped(self):
+        # Defensive: a future key in location_fields not in _LOCATION_FIELDS
+        # should not crash the writer.
+        args = _location_field_args({"Country": "Italy", "Unknown": "x"})
+        assert "-XMP-photoshop:Country=Italy" in args
+        assert all("Unknown" not in a for a in args)
+
+    def test_iptc_targets_stripped_on_sidecar_phase(self):
+        # IPTC writes can't go into a .xmp sidecar; _xmp_only_args
+        # must filter them out alongside the keyword IPTC writes.
+        args = _location_field_args({"City": "Rome"})
+        kept = _xmp_only_args(args)
+        assert "-XMP-photoshop:City=Rome" in kept
+        assert "-IPTC:City=Rome" not in kept
 
 
 class TestNonXmpWriteArg:
@@ -118,12 +187,14 @@ def test_xmp_only_args_strips_non_xmp_writes():
         "-IPTC:Keywords+=Cat",
         "-XMP-dc:Subject+=Cat",
         "-XMP-digiKam:TagsList+=Objects/Animal/Cat",
+        "-XMP-lr:HierarchicalSubject+=Objects|Animal|Cat",
         "-EXIF:DateTimeOriginal=2026:01:01 00:00:00",
     ]
     assert _xmp_only_args(args) == [
         "-overwrite_original",
         "-XMP-dc:Subject+=Cat",
         "-XMP-digiKam:TagsList+=Objects/Animal/Cat",
+        "-XMP-lr:HierarchicalSubject+=Objects|Animal|Cat",
     ]
 
 

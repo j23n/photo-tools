@@ -134,9 +134,10 @@ class TestIsPlausibleWord:
 
 class TestTagsFromGps:
     def test_no_coords_returns_empty(self):
-        places, cc = tags_from_gps({})
+        places, cc, parts = tags_from_gps({})
         assert places == []
         assert cc is None
+        assert parts == {}
 
     def test_full_address_builds_nested_path(self):
         fake_response = {
@@ -147,16 +148,26 @@ class TestTagsFromGps:
             "country_code": "it",
         }
         with patch("photo_tools.autotag.reverse_geocode", return_value=fake_response):
-            places, cc = tags_from_gps({"GPSLatitude": 41.9, "GPSLongitude": 12.5})
+            places, cc, parts = tags_from_gps(
+                {"GPSLatitude": 41.9, "GPSLongitude": 12.5})
         assert places == ["Places/Italy/Lazio/Rome/Municipio Roma I"]
         assert cc == "IT"
+        assert parts == {
+            "Country": "Italy",
+            "State": "Lazio",
+            "City": "Rome",
+            "Sublocation": "Municipio Roma I",
+            "CountryCode": "IT",
+        }
 
     def test_collapses_missing_levels(self):
         fake_response = {"country": "france", "country_code": "fr"}
         with patch("photo_tools.autotag.reverse_geocode", return_value=fake_response):
-            places, cc = tags_from_gps({"GPSLatitude": 48.8, "GPSLongitude": 2.3})
+            places, cc, parts = tags_from_gps(
+                {"GPSLatitude": 48.8, "GPSLongitude": 2.3})
         assert places == ["Places/France"]
         assert cc == "FR"
+        assert parts == {"Country": "France", "CountryCode": "FR"}
 
     def test_falls_back_to_alternate_keys(self):
         # Nominatim returns 'town' instead of 'city' for smaller settlements.
@@ -166,14 +177,17 @@ class TestTagsFromGps:
             "country_code": "de",
         }
         with patch("photo_tools.autotag.reverse_geocode", return_value=fake_response):
-            places, _ = tags_from_gps({"GPSLatitude": 48.0, "GPSLongitude": 7.85})
+            places, _, parts = tags_from_gps(
+                {"GPSLatitude": 48.0, "GPSLongitude": 7.85})
         assert places == ["Places/Germany/Freiburg"]
+        assert parts["City"] == "Freiburg"
 
     def test_empty_geocode_response(self):
         with patch("photo_tools.autotag.reverse_geocode", return_value={}):
-            places, cc = tags_from_gps({"GPSLatitude": 0, "GPSLongitude": 0})
+            places, cc, parts = tags_from_gps({"GPSLatitude": 0, "GPSLongitude": 0})
         assert places == []
         assert cc is None
+        assert parts == {}
 
 
 class TestDecideFixPipelines:

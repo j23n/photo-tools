@@ -92,6 +92,19 @@ def xmp_sidecar_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".xmp")
 
 
+def alt_xmp_sidecar_path(path: Path) -> Path | None:
+    """IMG_1234.jpg → IMG_1234.xmp (Lightroom / Capture One convention).
+
+    Returns None if the alt path would collide with the canonical path
+    (i.e. the input is already a .xmp file). Used only for *reads* —
+    writes always go to the canonical `IMG_1234.jpg.xmp`.
+    """
+    alt = path.with_suffix(".xmp")
+    if alt == path:
+        return None
+    return alt
+
+
 # Tag-write args targeting these groups can't go into a pure XMP file
 # (no IPTC/EXIF/QuickTime sections in an XMP sidecar). Stripped before
 # the sidecar phase of every write.
@@ -192,6 +205,13 @@ def _expand_paths_with_sidecars(
         if sidecar.exists():
             files.append(str(sidecar))
             str_to_path[str(sidecar)] = p
+            continue
+        # Fall back to the Lightroom / Capture One convention
+        # (IMG_1234.xmp) if the canonical sidecar isn't there.
+        alt = alt_xmp_sidecar_path(p)
+        if alt is not None and alt.exists():
+            files.append(str(alt))
+            str_to_path[str(alt)] = p
     return files, str_to_path
 
 
@@ -282,19 +302,27 @@ def leaf_of(tag: str) -> str:
 # ---------------------------------------------------------------------------
 # Exiftool tag operations
 #
-# Two output fields per docs/xmp-schema.md §1.1:
-#   dc:subject (= IPTC:Keywords): leaf names only
-#   digiKam:TagsList:             full hierarchical path with '/' separator
+# Output fields per docs/xmp-schema.md §1.1:
+#   dc:subject (= IPTC:Keywords):    leaf names only
+#   digiKam:TagsList:                full hierarchical path, '/' separator
+#   lr:HierarchicalSubject:          full hierarchical path, '|' separator
+#                                    (Lightroom / Bridge native)
+#   iptcExt:PersonInImage:           leaf only, for People/* tags
 # ---------------------------------------------------------------------------
 
 def _build_tag_args(tag: str, operator: str) -> list[str]:
     """Build exiftool args for a single hierarchical tag. operator is '+=' or '-='."""
     leaf = leaf_of(tag)
-    return [
+    lr_path = tag.replace("/", "|")
+    args = [
         f"-IPTC:Keywords{operator}{leaf}",
         f"-XMP-dc:Subject{operator}{leaf}",
         f"-XMP-digiKam:TagsList{operator}{tag}",
+        f"-XMP-lr:HierarchicalSubject{operator}{lr_path}",
     ]
+    if tag.startswith("People/"):
+        args.append(f"-XMP-iptcExt:PersonInImage{operator}{leaf}")
+    return args
 
 
 def add_tags(
@@ -404,6 +432,8 @@ def clear_all_keywords(path: Path, dry_run: bool = False) -> bool:
         "-overwrite_original",
         "-IPTC:Keywords=", "-XMP-dc:Subject=",
         "-XMP-digiKam:TagsList=",
+        "-XMP-lr:HierarchicalSubject=",
+        "-XMP-iptcExt:PersonInImage=",
     ]
     targets = [t for t in _write_targets(path)
                if t.suffix.lower() != ".xmp" or t.exists()]
@@ -427,6 +457,7 @@ _ALL_TAG_FIELDS = (
     "XMP-dc:Subject",
     "XMP-digiKam:TagsList",
     "XMP-lr:HierarchicalSubject",
+    "XMP-iptcExt:PersonInImage",
     "MicrosoftPhoto:LastKeywordXMP",
     "MediaPro:CatalogSets",
     "MicrosoftPhoto:CategorySet",
@@ -512,12 +543,7 @@ def clear_all_tags(
     for path, people_tags in with_people:
         args = ["-overwrite_original", *clear_args]
         for tag in people_tags:
-            leaf = tag.rsplit("/", 1)[-1]
-            args.extend([
-                f"-IPTC:Keywords+={leaf}",
-                f"-XMP-dc:Subject+={leaf}",
-                f"-XMP-digiKam:TagsList+={tag}",
-            ])
+            args.extend(_build_tag_args(tag, "+="))
         targets = [t for t in _write_targets(path)
                    if t.suffix.lower() != ".xmp" or t.exists()]
         try:
@@ -1073,11 +1099,42 @@ def write_embedding(path: Path, vec: np.ndarray, model: str, dry_run: bool) -> N
 _OCR_ROLE_IDENTIFIER = "http://cv.iptc.org/newscodes/imageregionrole/annotatedText"
 
 
+# Map of our location-part keys to the exiftool field names they fan out to.
+# The first entry in each tuple is XMP (always written), the second is the
+# legacy IPTC IIM field (skipped on the sidecar phase by _xmp_only_args).
+# See docs/xmp-schema.md §1.5.
+_LOCATION_FIELDS = {
+    "Country":     ("XMP-photoshop:Country",   "IPTC:Country-PrimaryLocationName"),
+    "CountryCode": ("XMP-iptcCore:CountryCode", "IPTC:Country-PrimaryLocationCode"),
+    "State":       ("XMP-photoshop:State",     "IPTC:Province-State"),
+    "City":        ("XMP-photoshop:City",      "IPTC:City"),
+    "Sublocation": ("XMP-iptcCore:Location",   "IPTC:Sub-location"),
+}
+
+
+def _location_field_args(location_fields: dict[str, str]) -> list[str]:
+    """Build exiftool args to set IPTC-standard location fields.
+
+    Each key writes to both an XMP and an IPTC IIM field for cross-app
+    compatibility. Empty values clear the corresponding fields.
+    """
+    args: list[str] = []
+    for key, value in location_fields.items():
+        targets = _LOCATION_FIELDS.get(key)
+        if not targets:
+            continue
+        for field in targets:
+            args.append(f"-{field}={value}")
+    return args
+
+
 def write_metadata(
     path: Path,
     *,
     new_keywords: list[str] = (),
     namespace_fields: dict[str, str] | None = None,
+    location_fields: dict[str, str] | None = None,
+    person_in_image: list[str] | None = None,
     ocr_text: list[str] | None = None,
     new_ocr_regions: list[dict] | None = None,
     existing_iptc_regions: list[dict] | None = None,
@@ -1088,14 +1145,20 @@ def write_metadata(
 ) -> bool:
     """Single-spawn metadata write for the autotag inner loop.
 
-    Consolidates keyword adds, photo-tools namespace fields, OCR text/regions,
-    OCRRan stamp, CLIP embedding, and the TaggerVersion+TaggedAt sentinel
-    into one exiftool invocation. Keywords use `+=` so non-photo-tools tags
-    are preserved; structural fields (IPTC:ImageRegion, OCRText) ride along
-    in a JSON sidecar passed in the same exiftool call.
+    Consolidates keyword adds, photo-tools namespace fields, IPTC location
+    fields, PersonInImage projection, OCR text/regions, OCRRan stamp, CLIP
+    embedding, and the TaggerVersion+TaggedAt sentinel into one exiftool
+    invocation. Keywords use `+=` so non-photo-tools tags are preserved;
+    structural fields (IPTC:ImageRegion, OCRText) ride along in a JSON
+    sidecar passed in the same exiftool call.
+
+    `person_in_image` is a list of person leaf names; when supplied, the
+    XMP-iptcExt:PersonInImage list is replaced (not appended) so it stays
+    in sync with the file's current People/* keywords.
     """
     has_anything = bool(
-        new_keywords or namespace_fields or ocr_text or new_ocr_regions
+        new_keywords or namespace_fields or location_fields
+        or person_in_image is not None or ocr_text or new_ocr_regions
         or embedding is not None or stamp_ocr_ran
     )
     if not has_anything:
@@ -1109,6 +1172,10 @@ def write_metadata(
                 log.info("    %s", kw)
         for k, v in sorted((namespace_fields or {}).items()):
             log.info("    photo-tools:%s = %s", k, v)
+        for k, v in sorted((location_fields or {}).items()):
+            log.info("    location:%s = %s", k, v)
+        if person_in_image is not None:
+            log.info("    PersonInImage = %s", ", ".join(person_in_image) or "(cleared)")
         if new_ocr_regions:
             log.info("  %d OCR region(s)", len(new_ocr_regions))
         if stamp_ocr_ran:
@@ -1122,6 +1189,16 @@ def write_metadata(
 
     for kw in new_keywords:
         args.extend(_build_tag_args(kw, "+="))
+
+    if location_fields:
+        args.extend(_location_field_args(location_fields))
+
+    if person_in_image is not None:
+        # Replace, not append: keep the list in sync with the current set
+        # of People/* leaves. `=` clears, then `+=` rebuilds.
+        args.append("-XMP-iptcExt:PersonInImage=")
+        for name in person_in_image:
+            args.append(f"-XMP-iptcExt:PersonInImage+={name}")
 
     args.extend([
         f"-XMP-phototools:TaggerVersion={TAGGER_VERSION}",

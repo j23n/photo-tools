@@ -7,13 +7,13 @@ Auto-tag photos and manage image metadata using RAM++, CLIP landmark lookup, Pad
 - **RAM++ tagging** — Recognize Anything Plus Plus for multi-label image content recognition. Mapped to `Objects/` and `Scenes/` keywords with per-category confidence and count limits.
 - **Landmark lookup** — CLIP embeddings + GPS radius filtering against a FAISS-indexed Wikidata landmark database. Emits a single `Landmarks/<Name>` keyword.
 - **OCR text detection** — PaddleOCR extracts visible text and writes it to `photo-tools:OCRText` (custom XMP namespace) with IPTC ImageRegion metadata. Keeps OCR phrases out of the keyword/tag tree.
-- **GPS reverse geocoding** — Nominatim turns coordinates into a single nested `Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]` keyword. The country code is also written separately to `photo-tools:CountryCode`.
+- **GPS reverse geocoding** — Nominatim turns coordinates into a single nested `Places/<Country>[/<Region>[/<City>[/<Neighborhood>]]]` keyword and the IPTC-standard structured location fields (`XMP-photoshop:City/State/Country`, `XMP-iptcCore:CountryCode`/`Location`, plus IPTC IIM mirrors), so the data shows up in the Location panel of every IPTC-aware DAM (Lightroom, Bridge, Capture One, Photo Mechanic, Mylio, ACDSee, …).
 - **GPS timeline inference** — Images without GPS inherit coordinates from nearby photos taken within 30 minutes.
 - **Visual duplicate detection** — Find visually similar images using CLIP embeddings with an interactive dedup session. Supports undoing previous moves via a sidecar manifest.
 - **Tag management** — List, search, delete, rename, clear, and inspect tags across image collections.
 - **Landmark database builder** — Scrape Wikidata for notable landmarks and build a CLIP embedding index.
 - **Watch mode** — Monitor a directory and auto-tag new images as they appear.
-- **XMP sidecars (optional)** — pass `--xmp-sidecars` to mirror every metadata write into a sibling `IMG_1234.jpg.xmp` and merge it back on read. Off by default. See [`docs/xmp-schema.md`](docs/xmp-schema.md) §1.3.
+- **XMP sidecars (optional)** — pass `--xmp-sidecars` to mirror every metadata write into a sibling `IMG_1234.jpg.xmp` and merge it back on read. Off by default. Reads also fall back to the Lightroom / Capture One sidecar form (`IMG_1234.xmp`) when the canonical form is absent. See [`docs/xmp-schema.md`](docs/xmp-schema.md) §1.4.
 
 ## Requirements
 
@@ -80,6 +80,29 @@ photo-tools -v tag /path/to/photos                # verbose logging
 photo-tools --config overrides.yaml tag /photos   # custom config overlay
 photo-tools --xmp-sidecars tag /photos            # mirror writes to .xmp sidecars
 ```
+
+## Compatibility with other photo managers
+
+photo-tools writes industry-standard XMP/IPTC metadata. It is digiKam-shaped
+(taxonomy and `digiKam:TagsList` round-trip cleanly), but the keyword data,
+location data, and people projection are also surfaced by every major
+keyword-aware DAM. See [`docs/xmp-schema.md`](docs/xmp-schema.md) §4 for the
+full interop matrix; the headline summary:
+
+| App | What surfaces |
+| --- | --- |
+| **digiKam** | Excellent — full hierarchy, People view, Location panel |
+| **Lightroom Classic / Bridge** | Keyword hierarchy (via `lr:HierarchicalSubject`) and Location panel (via `XMP-photoshop:City/State/Country`) |
+| **Photo Mechanic / Mylio** | Keywords, IPTC Location, `PersonInImage` |
+| **Capture One / ACDSee / Excire / XnView** | Flat keywords + IPTC Location |
+| **PhotoPrism / Immich** | Tags + (location reading varies) |
+| **Apple Photos** | Flat keywords on first import only — no re-sync |
+| **Google Photos** | None — Google strips metadata on upload |
+
+OCR text (`photo-tools:OCRText`) is in a tool-private namespace and only
+photo-tools / `exiftool` will surface it. Face regions (`XMP-mwg-rs`) are
+intentionally out-of-scope: photo-tools doesn't do face detection, so it
+defers that lane to digiKam / Lightroom / Mylio.
 
 ## Architecture
 
