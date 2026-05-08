@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import requests
 
+from photo_tools import tui
 from photo_tools.config import get_config
 from photo_tools.constants import (
     IMAGE_EXTENSIONS,
@@ -45,7 +46,6 @@ from photo_tools.helpers import (
     remove_tags,
     write_metadata,
 )
-from photo_tools import tui
 from photo_tools.logging_setup import (
     PhotoSummary,
     get_counter,
@@ -124,18 +124,28 @@ def get_gps_coords(exif: dict) -> tuple[float, float] | None:
 
 
 def _parse_exif_datetime(exif: dict) -> datetime | None:
+    """Parse an EXIF timestamp ('2026:05:07 12:34:56' or ISO) to a datetime.
+
+    Subsecond and timezone suffixes are ignored. Returns None on malformed
+    input.
+    """
     date_str = exif.get("DateTimeOriginal") or exif.get("CreateDate")
     if not date_str or not isinstance(date_str, str) or len(date_str) < 10:
         return None
     try:
+        # Normalize ISO ('2026-05-07T12:34:56') to EXIF shape so a single
+        # `:` split below can extract every field.
         clean = date_str.replace("-", ":").replace("T", " ")
         parts = clean.split(":")
-        if len(parts) >= 5:
+        # parts = ['YYYY', 'MM', 'DD HH', 'MM', 'SS[.fff][±HH][:MM]']
+        if len(parts) >= 4:
             year, month = int(parts[0]), int(parts[1])
-            rest = parts[2].split()
-            day = int(rest[0])
-            hour = int(parts[3])
-            minute = int(parts[4].split(".")[0].split("+")[0].split("-")[0])
+            day_hour = parts[2].split()
+            if len(day_hour) < 2:
+                return None
+            day = int(day_hour[0])
+            hour = int(day_hour[1])
+            minute = int(parts[3].split(".")[0].split("+")[0].split("-")[0])
             return datetime(year, month, day, hour, minute)
     except (ValueError, IndexError):
         pass
@@ -371,7 +381,7 @@ def tags_from_ocr(path: Path) -> tuple[list[str], list[dict]]:
         texts = page.get("rec_texts", [])
         scores = page.get("rec_scores", [])
 
-        for poly, text, score in zip(polys, texts, scores):
+        for poly, text, score in zip(polys, texts, scores, strict=False):
             if score < cfg.ocr.min_confidence:
                 continue
 
@@ -1060,10 +1070,14 @@ def run_tag_fix(args) -> None:
 
     counts = {"gps": 0, "ram": 0, "landmarks": 0, "ocr": 0}
     for _, (g, r, lm, o) in needs_work:
-        if g: counts["gps"] += 1
-        if r: counts["ram"] += 1
-        if lm: counts["landmarks"] += 1
-        if o: counts["ocr"] += 1
+        if g:
+            counts["gps"] += 1
+        if r:
+            counts["ram"] += 1
+        if lm:
+            counts["landmarks"] += 1
+        if o:
+            counts["ocr"] += 1
     log.info("Pipeline workload: GPS=%d, RAM++=%d, Landmarks=%d, OCR=%d",
              counts["gps"], counts["ram"], counts["landmarks"], counts["ocr"])
 

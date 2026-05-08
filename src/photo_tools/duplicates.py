@@ -17,7 +17,7 @@ import sys
 import tempfile
 import termios
 import tty
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -249,7 +249,7 @@ def _append_manifest(dest_root: Path, original: Path, moved_to: Path) -> None:
     entry = {
         "original": str(original),
         "moved_to": str(moved_to),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
     }
     with open(_manifest_path(dest_root), "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -325,7 +325,8 @@ def _create_contact_sheet(
     Items whose status is not PRESENT render as a placeholder ("MOVED" or
     "MISSING") so the grid layout still matches the cluster's index numbering.
     """
-    from PIL import Image as PILImage, ImageDraw, ImageFont
+    from PIL import Image as PILImage
+    from PIL import ImageDraw, ImageFont
 
     n = len(paths)
     cols = min(n, math.ceil(math.sqrt(n)))
@@ -363,7 +364,9 @@ def _create_contact_sheet(
                 ox = x0 + (cell_w - img.width) // 2
                 oy = y0 + (cell_h - img.height) // 2
                 sheet.paste(img, (ox, oy))
-            except Exception:
+            except Exception as e:
+                log.debug("Contact-sheet thumbnail failed for %s: %s",
+                          path.name, e)
                 draw.rectangle([x0 + 2, y0 + 2, x0 + cell_w - 2, y0 + cell_h - 2],
                                outline=(100, 100, 100))
         else:
@@ -569,7 +572,10 @@ def interactive_similar_session(
                     start_new_session=True,
                 )
 
-            def _refresh_sheet():
+            # paths_list / statuses are captured by reference; the closure
+            # is only ever called during this same loop iteration, so the
+            # standard B023 caveat about late-binding doesn't apply here.
+            def _refresh_sheet(paths_list=paths_list, statuses=statuses):
                 nonlocal sheet_path
                 if sheet_path:
                     try:

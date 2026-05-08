@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -322,7 +322,7 @@ def add_tags(
                 log.info("    photo-tools:%s = %s", k, v)
         return True
 
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now(UTC).isoformat()
     args = ["-overwrite_original"]
     for kw in keywords:
         args.extend(_build_tag_args(kw, "+="))
@@ -760,7 +760,8 @@ except ImportError:
     _HAVE_PILLOW_HEIF = False
 
 try:
-    from PIL import Image as PILImage, ImageOps
+    from PIL import Image as PILImage
+    from PIL import ImageOps
     _HAVE_PILLOW = True
 except ImportError:
     _HAVE_PILLOW = False
@@ -793,7 +794,8 @@ def _try_pillow(path: Path, tmp_path: str, max_pixels: int) -> bool:
             img = img.convert("RGB")
         img.save(tmp_path, "JPEG", quality=cfg.image.jpeg_quality)
         return Path(tmp_path).stat().st_size > 0
-    except Exception:
+    except Exception as e:
+        log.debug("Pillow downscale failed for %s: %s", path.name, e)
         return False
 
 
@@ -824,8 +826,8 @@ def _read_exif_orientation(path: Path) -> int:
                 n = int(val)
                 if 1 <= n <= 8:
                     return n
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Failed to read EXIF orientation for %s: %s", path.name, e)
     return 1
 
 
@@ -1115,7 +1117,7 @@ def write_metadata(
             log.info("    photo-tools:CLIPEmbedding (%s)", embedding_model or "?")
         return True
 
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now(UTC).isoformat()
     args = ["-overwrite_original"]
 
     for kw in new_keywords:

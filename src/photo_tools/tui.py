@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 
 # All state is module-level — only one tag run can be in flight at a time.
-_state: "_TUIState | None" = None
+_state: _TUIState | None = None
 _live = None
 _console = None
 _rich_handler: logging.Handler | None = None

@@ -491,7 +491,7 @@ def query_wikidata_geo(
     landmarks: list[dict] = []
     overflow: list[dict] = []
 
-    for label, type_results in per_type.items():
+    for type_results in per_type.values():
         type_results.sort(key=lambda x: x["_sitelinks"], reverse=True)
         landmarks.extend(type_results[:quota])
         overflow.extend(type_results[quota:])
@@ -685,8 +685,7 @@ def build_database(
         log.info("Collecting image URLs for %d landmarks ...", len(urls_to_fetch))
         for i, lm in enumerate(urls_to_fetch, 1):
             wid = lm["wikidata_id"]
-            print(f"\r  urls [{i}/{len(urls_to_fetch)}] {lm['name']:<50}",
-                  end="", flush=True, file=sys.stderr)
+            log.debug("  urls [%d/%d] %s", i, len(urls_to_fetch), lm["name"])
             images = fetch_image_urls(wid, target=images_per_landmark)
             landmark_urls[wid] = {
                 "name": lm["name"],
@@ -697,8 +696,9 @@ def build_database(
             urls_cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(urls_cache_path, "w") as f:
                 json.dump(landmark_urls, f)
+            if i % 25 == 0 or i == len(urls_to_fetch):
+                log.info("  urls progress: %d/%d", i, len(urls_to_fetch))
             time.sleep(0.5)  # be kind to the APIs
-        print(file=sys.stderr)
         log.info("Collected URLs for %d landmarks (total %d in cache)",
                  len(urls_to_fetch), len(landmark_urls))
 
@@ -762,11 +762,9 @@ def build_database(
                             downloaded_count += 1
                     else:
                         download_failed += 1
-                    if done_count % 10 == 0 or done_count == total:
-                        print(f"\r  images [{done_count}/{total}] "
-                              f"{downloaded_count} new, {download_failed} failed",
-                              end="", flush=True, file=sys.stderr)
-            print(file=sys.stderr)
+                    if done_count % 25 == 0 or done_count == total:
+                        log.info("  images [%d/%d] %d new, %d failed",
+                                 done_count, total, downloaded_count, download_failed)
 
         # Embed this batch
         for lm in batch:
@@ -776,12 +774,10 @@ def build_database(
                 continue
 
             global_idx = batch_start + batch.index(lm) + 1
-            print(f"\r  embedding [{global_idx}/{total_landmarks}] "
-                  f"{lm['name']:<40} ({len(paths)} images)",
-                  end="", flush=True, file=sys.stderr)
+            log.debug("  embedding [%d/%d] %s (%d images)",
+                      global_idx, total_landmarks, lm["name"], len(paths))
 
             if embedder is None:
-                print(file=sys.stderr)
                 embedder = CLIPEmbedder(model_name=clip_model, pretrained=clip_pretrained)
 
             embeddings = []
@@ -809,7 +805,6 @@ def build_database(
             })
 
         # Save after each batch
-        print(file=sys.stderr)
         _save(output_path, clip_model, clip_pretrained, results)
 
     log.info("Done. %d landmarks saved, %d download failed, %d embed failed",

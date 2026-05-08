@@ -7,15 +7,15 @@ arrow keys, quit with ``q``.
 
 import os
 import platform
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import termios
 import tty
 from pathlib import Path
 
-from photo_tools.autotag import get_gps_coords, _parse_exif_datetime
+from photo_tools.autotag import _parse_exif_datetime, get_gps_coords
 from photo_tools.helpers import find_images, get_existing_keywords, read_exif
 from photo_tools.logging_setup import get_logger
 
