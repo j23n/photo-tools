@@ -4,6 +4,27 @@ version = "0.1.0"
 description = "Auto-tag photos using RAM++, CLIP landmarks, PaddleOCR, GPS geocoding, and EXIF metadata"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Johannes", email = "mail@j23n.com"},
+]
+keywords = [
+    "photo", "tagging", "metadata", "exif", "xmp", "iptc", "digikam",
+    "clip", "ocr", "gps", "geocoding", "landmarks", "ram-plus-plus",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Utilities",
+]
 dependencies = [
     "pillow-heif>=1.3.0",
     "pyyaml>=6.0",
@@ -26,9 +47,33 @@ dependencies = [
     "rich>=15.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/j23n/photo-tools"
+Source = "https://github.com/j23n/photo-tools"
+Issues = "https://github.com/j23n/photo-tools/issues"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length — long URLs / SPARQL strings are fine
+    "B008",   # function call in default argument — used intentionally
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
 [dependency-groups]
 dev = [
     "ruff>=0.15.9",
+    "pytest>=8.0",
 ]
 
 [build-system]
