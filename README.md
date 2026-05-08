@@ -15,10 +15,20 @@ Auto-tag photos and manage image metadata using RAM++, CLIP landmark lookup, Pad
 - **Watch mode** — Monitor a directory and auto-tag new images as they appear.
 - **XMP sidecars (optional)** — pass `--xmp-sidecars` to mirror every metadata write into a sibling `IMG_1234.jpg.xmp` and merge it back on read. Off by default. See [`docs/xmp-schema.md`](docs/xmp-schema.md) §1.3.
 
+## Requirements
+
+- **Python 3.12+**
+- **[`uv`](https://docs.astral.sh/uv/)** — used for dependency management. Falls back to pip-installable, but `uv sync` is the supported path.
+- **[exiftool](https://exiftool.org/)** on `PATH` — every metadata read and write goes through it.
+- **[ffmpeg](https://ffmpeg.org/)** on `PATH` — only required for video frame extraction (the `tag` pipeline samples one frame per video for RAM++/CLIP/OCR).
+- **`git`** on `PATH` — one dependency (`recognize-anything`) is fetched from a Git source at install time.
+- **~5 GB free disk** for first-run model downloads (RAM++ Swin-Large, OpenCLIP ViT-B-32, PaddleOCR mobile models) plus whatever the Wikidata landmark index ends up at (a few hundred MB for ~5000 landmarks).
+- Runs CPU-only by default; CUDA / Apple Silicon MPS are picked up automatically when available.
+
 ## Quickstart
 
 ```bash
-# Install (requires exiftool on PATH)
+# Install (requires exiftool, ffmpeg, and git on PATH)
 uv sync
 
 # Auto-tag a directory of photos (always recurses into subdirectories)
@@ -98,3 +108,30 @@ src/photo_tools/
 ```
 
 All thresholds and parameters live in `default_config.yaml` and can be overridden with `--config path/to/overrides.yaml`. The XMP/IPTC schema photo-tools writes — including the `photo-tools:` custom namespace — is documented in [`docs/xmp-schema.md`](docs/xmp-schema.md).
+
+## Development
+
+```bash
+# Install with dev dependencies
+uv sync
+
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check .
+uv run ruff format --check .
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the contribution workflow.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Bundled and downloaded models carry their own licenses:
+
+- **RAM++** (`ram_plus_swin_large_14m.pth`) — Apache-2.0 ([recognize-anything](https://github.com/xinyu1205/recognize-anything))
+- **OpenCLIP ViT-B-32 / laion2b_s34b_b79k** — MIT ([open_clip](https://github.com/mlfoundations/open_clip))
+- **PaddleOCR PP-OCRv5 mobile** — Apache-2.0 ([PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR))
+- **Wikidata** content (used by the landmark scraper) — CC0; landmark images on Wikimedia Commons carry per-file licenses.

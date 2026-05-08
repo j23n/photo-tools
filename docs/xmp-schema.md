@@ -23,11 +23,11 @@ Both fields use **Titlecase** for every path segment (see §3).
 For example:
 
 ```
-dc:subject       = [Chiara, Johannes, Italy, Lazio, Rome, Municipio Roma I,
+dc:subject       = [Alice, Bob, Italy, Lazio, Rome, Municipio Roma I,
                     Colosseum, Balustrade, Rail, Building, Cityscape]
 IPTC:Keywords    = (same as dc:subject)
 digiKam:TagsList = [
-    People/Chiara, People/Johannes,                  # written by digiKam, not us
+    People/Alice, People/Bob,                        # written by digiKam, not us
     Places/Italy/Lazio/Rome/Municipio Roma I,
     Landmarks/Colosseum,
     Objects/Balustrade, Objects/Rail,
