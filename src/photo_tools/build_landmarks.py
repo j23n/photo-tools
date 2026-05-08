@@ -265,6 +265,11 @@ def fetch_image_urls(wikidata_id: str, target: int | None = None) -> list[dict]:
 def _classify_region(lat: float, lon: float) -> str:
     """Bucket a (lat, lon) into a coarse continent label for per-region capping.
 
+    Africa is split into two latitude bands so the eastern horn / Madagascar
+    are claimed without dragging Saudi Arabia and Yemen along: south of 15°N
+    Africa extends to lon 52°E (covering Kenya, Somalia, Madagascar); above
+    15°N it stops at lon 35°E so the Arabian peninsula stays in Asia.
+
     Mediterranean North Africa west of Egypt is intentionally claimed by
     Europe given the fuzzy boundary; this is a small fraction of total
     landmarks.
@@ -275,7 +280,9 @@ def _classify_region(lat: float, lon: float) -> str:
         return "N.America"
     if -55 <= lat <= 15 and -85 <= lon <= -35:
         return "S.America"
-    if -35 <= lat < 35 and -20 <= lon <= 35:
+    if -35 <= lat <= 15 and -20 <= lon <= 52:
+        return "Africa"
+    if 15 < lat < 35 and -20 <= lon <= 35:
         return "Africa"
     if 5 <= lat < 35 and 35 <= lon <= 150:
         return "Asia"

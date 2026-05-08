@@ -235,13 +235,17 @@ Every segment of every keyword/tag path is **Titlecase**, including
 geocoder-derived values.
 
 - ASCII text, single-word: `str.title()` is sufficient (`rome` → `Rome`).
-- Multi-word, mixed-language, Roman numerals: use the
+- Multi-word, mixed-language, Roman numerals, diacritics: use the
   [`titlecase`](https://pypi.org/project/titlecase/) PyPI library
-  (`municipio roma i` → `Municipio Roma I`, `città del vaticano` → `Città del
-  Vaticano`).
+  (`municipio roma i` → `Municipio Roma I`,
+  `state of the art` → `State of the Art`,
+  `città del vaticano` → `Città Del Vaticano`).
 
-The `titlecase` library handles small words ("of", "the", "del"), Roman
-numerals, and acronyms out of the box.
+The `titlecase` library preserves diacritics, detects Roman numerals,
+and keeps English small words (`of`, `the`, `a`, `in`) lowercase. Small
+words from other languages (Italian `del`, Portuguese `de`, French `de
+la`) are uppercased, since photo-tools uses the library's default
+English mode rather than configuring per-locale callbacks.
 
 ---
 

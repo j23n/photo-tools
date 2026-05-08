@@ -17,9 +17,15 @@ from photo_tools.build_landmarks import _classify_region
     ("Sydney",       -33.8688, 151.2093, "Oceania"),
     ("Auckland",     -36.8485, 174.7633, "Oceania"),
     ("Cape Town",    -33.9249,  18.4241, "Africa"),
-    # Nairobi (lon ≈ 36.8) and other eastern-Africa cities currently fall
-    # into the "Other" bucket — Africa's lon bbox stops at 35. Acknowledged
-    # gap in the classifier; the regional pass is robust to "Other".
+    ("Nairobi",       -1.2921,  36.8219, "Africa"),
+    ("Addis Ababa",    9.0320,  38.7423, "Africa"),
+    ("Mogadishu",      2.0469,  45.3182, "Africa"),
+    ("Antananarivo", -18.8792,  47.5079, "Africa"),
+    ("Cairo",         30.0444,  31.2357, "Africa"),
+    # Arabian peninsula stays in Asia despite being east of the new
+    # extended Africa lon bound (the lat>15 band keeps the original lon=35).
+    ("Riyadh",        24.7136,  46.6753, "Asia"),
+    ("Sanaa",         15.3694,  44.1910, "Asia"),
 ])
 def test_classify_known_cities(name, lat, lon, expected):
     assert _classify_region(lat, lon) == expected, name
