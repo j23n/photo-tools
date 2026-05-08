@@ -9,7 +9,9 @@ LandmarkIndex.
 
 import io
 import json
+import os
 import sys
+import tempfile
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -545,17 +547,22 @@ def _save_stream(resp: requests.Response, dest: Path, wikidata_id: str, filename
     """Stream response to *dest*, returning True on success."""
     cfg = get_config()
     IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
-        for chunk in resp.iter_content(8192):
-            f.write(chunk)
-    size = tmp.stat().st_size
-    if size < cfg.wikidata.min_image_size:
-        log.warning("Downloaded image too small for %s (%s): %d bytes", wikidata_id, filename, size)
-        tmp.unlink()
-        return False
-    tmp.rename(dest)
-    return True
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in resp.iter_content(8192):
+                f.write(chunk)
+        size = tmp.stat().st_size
+        if size < cfg.wikidata.min_image_size:
+            log.warning("Downloaded image too small for %s (%s): %d bytes", wikidata_id, filename, size)
+            tmp.unlink()
+            return False
+        tmp.rename(dest)
+        return True
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def download_image(url: str, wikidata_id: str, cache_key: str | None = None) -> tuple[Path | None, bool]:
@@ -591,7 +598,9 @@ def download_image(url: str, wikidata_id: str, cache_key: str | None = None) -> 
             img.thumbnail((max_width, max_width))
             img = img.convert("RGB")
             IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = cached.with_suffix(".tmp")
+            fd, tmp_name = tempfile.mkstemp(dir=IMAGE_CACHE_DIR, suffix=".tmp")
+            tmp = Path(tmp_name)
+            os.close(fd)
             img.save(tmp, "JPEG", quality=jpeg_quality)
             size = tmp.stat().st_size
             if size < min_size:
