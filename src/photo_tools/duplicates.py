@@ -700,9 +700,10 @@ def interactive_similar_session(
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_duplicates_parser(subparsers) -> argparse.ArgumentParser:
+def build_duplicates_parser(subparsers, parents=None) -> argparse.ArgumentParser:
     sub = subparsers.add_parser(
         "duplicates",
+        parents=parents or [],
         help="Find visual duplicates using CLIP embeddings (interactive picker).",
     )
     sub.add_argument("path", type=Path, help="Target directory or file")

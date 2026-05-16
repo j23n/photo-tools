@@ -203,30 +203,36 @@ def run_search_tags(args) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_tags_parser(subparsers) -> None:
+def build_tags_parser(subparsers, parents=None) -> None:
+    parents = parents or []
     tags_parser = subparsers.add_parser(
         "tags",
+        parents=parents,
         help="Tag management: list, search, delete, rename, clear.",
     )
     tags_sub = tags_parser.add_subparsers(dest="tags_command", required=True)
 
-    p = tags_sub.add_parser("list", help="List all tags with file counts.")
+    p = tags_sub.add_parser("list", parents=parents,
+                            help="List all tags with file counts.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.set_defaults(func=run_list_tags)
 
-    p = tags_sub.add_parser("search", help="List files that have a given tag.")
+    p = tags_sub.add_parser("search", parents=parents,
+                            help="List files that have a given tag.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", help="Tag to search for")
     p.set_defaults(func=run_search_tags)
 
-    p = tags_sub.add_parser("delete", help="Delete a tag (or regex pattern) from all files.")
+    p = tags_sub.add_parser("delete", parents=parents,
+                            help="Delete a tag (or regex pattern) from all files.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("tag", nargs="?", help="Exact tag to delete")
     p.add_argument("-p", "--pattern", help="Regex pattern to match tags for deletion")
     p.add_argument("-n", "--dry-run", action="store_true", help="Preview changes without writing")
     p.set_defaults(func=run_delete_tag)
 
-    p = tags_sub.add_parser("rename", help="Rename a tag across all files.")
+    p = tags_sub.add_parser("rename", parents=parents,
+                            help="Rename a tag across all files.")
     p.add_argument("path", type=Path, help="Target directory or file")
     p.add_argument("old", help="Tag to rename")
     p.add_argument("new", help="New tag name")
@@ -235,6 +241,7 @@ def build_tags_parser(subparsers) -> None:
 
     p = tags_sub.add_parser(
         "clear",
+        parents=parents,
         help="Wipe ALL tags and the photo-tools namespace, leaving only original EXIF.",
     )
     p.add_argument("path", type=Path, help="Target directory or file")
@@ -242,4 +249,4 @@ def build_tags_parser(subparsers) -> None:
     p.set_defaults(func=run_clear_tags)
 
     from photo_tools.debug_viewer import add_inspect_subparser
-    add_inspect_subparser(tags_sub)
+    add_inspect_subparser(tags_sub, parents=parents)

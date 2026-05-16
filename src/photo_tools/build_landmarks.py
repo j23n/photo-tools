@@ -832,16 +832,19 @@ def _save(output_path: Path, model: str, pretrained: str, landmarks: list[dict])
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_landmarks_parser(subparsers):
+def build_landmarks_parser(subparsers, parents=None):
     """Register the 'landmarks' subcommand group with generate-db + query."""
+    parents = parents or []
     lm_parser = subparsers.add_parser(
         "landmarks",
+        parents=parents,
         help="Landmark database tools: build the DB, or query an image against it.",
     )
     lm_sub = lm_parser.add_subparsers(dest="landmarks_command", required=True)
 
     gen = lm_sub.add_parser(
         "generate-db",
+        parents=parents,
         help="Build CLIP embedding database of notable landmarks from Wikidata.",
     )
     gen.add_argument("-o", "--output", type=Path,
@@ -865,6 +868,7 @@ def build_landmarks_parser(subparsers):
 
     q = lm_sub.add_parser(
         "query",
+        parents=parents,
         help="Query the landmark DB with an image and print the top matches.",
     )
     q.add_argument("image", type=Path, help="Path to an image to query")

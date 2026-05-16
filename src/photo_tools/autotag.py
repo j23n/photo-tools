@@ -772,9 +772,10 @@ def watch_directory(target, dry_run,
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_tag_parser(subparsers) -> argparse.ArgumentParser:
+def build_tag_parser(subparsers, parents=None) -> argparse.ArgumentParser:
     tag_parser = subparsers.add_parser(
         "tag",
+        parents=parents or [],
         help="Auto-tag photos (RAM++, landmarks, OCR, GPS, EXIF). "
              "Skips photos already at the current TaggerVersion. "
              "Pass --fix to fill in missing pipeline outputs instead.",

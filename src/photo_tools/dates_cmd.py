@@ -237,15 +237,18 @@ def run_backfill_dates(args) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def build_dates_parser(subparsers) -> None:
+def build_dates_parser(subparsers, parents=None) -> None:
+    parents = parents or []
     dates_parser = subparsers.add_parser(
         "dates",
+        parents=parents,
         help="Date metadata: backfill missing EXIF DateTimeOriginal.",
     )
     dates_sub = dates_parser.add_subparsers(dest="dates_command", required=True)
 
     p = dates_sub.add_parser(
         "backfill",
+        parents=parents,
         help="Write DateTimeOriginal for files missing it, recovered from "
              "filename patterns (WhatsApp/Signal/Telegram/Pixel/etc.) and "
              "optionally from filesystem mtime.",
